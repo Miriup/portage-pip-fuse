@@ -1183,7 +1183,7 @@ class EbuildDataExtractor:
             'SRC_URI': (package_info.get('source_distribution') or {}).get('url', ''),
             
             # Additional metadata
-            'KEYWORDS': '~amd64 ~x86',  # Default conservative keywords
+            'KEYWORDS': 'amd64 x86',  # Stable keywords - PyPI packages are generally stable releases
             'SLOT': '0',
         }
         

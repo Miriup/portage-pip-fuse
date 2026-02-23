@@ -2,6 +2,40 @@
 
 This document outlines the coding style and development practices for the portage-pip-fuse project.
 
+## Project Goals and Non-Goals
+
+### Primary Goals
+- Provide FUSE filesystem interface for PyPI packages to Gentoo portage
+- Filter packages by Python compatibility with the system (PYTHON_TARGETS)
+- Filter packages to only those with source distributions available
+- Support dependency resolution for specific packages with USE flags
+- Maintain high performance with comprehensive caching
+
+### Non-Goals  
+- **Curated package lists**: The curated filter is NOT intended for production use. We need automatic filtering based on system compatibility, not manual curation.
+- **Supporting all PyPI packages**: Only packages compatible with system Python and having source distributions should be visible.
+
+## Key Design Decisions
+
+### Default Filters  
+The following filters MUST work properly by default:
+1. **source-dist**: Filters packages to those with source distributions (required for Gentoo's build-from-source philosophy)
+2. **python-compat**: MUST be implemented efficiently to filter packages by system PYTHON_TARGETS
+   - Current implementation needs work - checking all 746k packages is impractical
+   - Should work on cached/indexed packages or use a more efficient approach
+   - This is ESSENTIAL for manageable package counts
+
+### Python Compatibility Enforcement
+Python compatibility is enforced at TWO levels:
+1. **Pre-filtering**: The python-compat filter reduces visible packages to compatible ones
+2. **Ebuild level**: PYTHON_COMPAT generation ensures accurate compatibility declarations
+
+### Bug Fixing Philosophy
+- **Never disable features to "fix" bugs** - properly implement them instead
+- **Filters are essential** - the python-compat filter is critical because PyPI has too many packages to handle without filtering
+- **Performance matters** - filters must be efficient enough to be practical
+- **Default behavior must be sensible** - showing incompatible packages wastes resources and confuses users
+
 ## General Principles
 
 1. **Use Original Code When Possible**: Whenever possible, utilize original pip or portage code from the reference repositories instead of reimplementing functionality.

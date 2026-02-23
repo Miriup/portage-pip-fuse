@@ -900,4 +900,4 @@ def mount_filesystem(mountpoint: str, foreground: bool = False, debug: bool = Fa
         
     logger.info(f"Mounting portage-pip FUSE filesystem at {mountpoint}")
     fs = PortagePipFS(cache_ttl=cache_ttl, cache_dir=cache_dir, filter_config=filter_config)
-    FUSE(fs, mountpoint, nothreads=True, foreground=foreground, debug=debug)
+    FUSE(fs, mountpoint, nothreads=True, foreground=foreground, debug=debug, allow_other=True)

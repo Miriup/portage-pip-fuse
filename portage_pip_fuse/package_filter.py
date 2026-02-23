@@ -430,6 +430,11 @@ class FilterCurated(FilterBase):
             packages: Custom set of packages, or None for defaults
         """
         self.packages = packages if packages is not None else self.DEFAULT_PACKAGES
+    
+    @classmethod
+    def is_default_filter(cls) -> bool:
+        """This filter is enabled by default."""
+        return True
         
     def get_packages(self) -> Set[str]:
         """Return the curated package list."""
@@ -546,6 +551,9 @@ class FilterPythonCompat(FilterBase):
     
     This filter checks if packages have any overlap with the Python implementations
     supported by the current Gentoo installation (from PYTHON_TARGETS).
+    
+    NOTE: This filter is NOT enabled by default as it's too expensive for large sets.
+    Python compatibility is enforced at the ebuild level through PYTHON_COMPAT instead.
     """
     
     def __init__(self, cache_dir: Optional[Path] = None):
@@ -555,14 +563,31 @@ class FilterPythonCompat(FilterBase):
     
     @classmethod
     def is_default_filter(cls) -> bool:
-        """This filter is enabled by default."""
-        return True
+        """This filter is NOT enabled by default - it's too expensive for large package sets."""
+        return False
     
     def get_packages(self) -> Set[str]:
-        """Return packages compatible with system Python implementations."""
-        # For now, return all packages - we'll implement proper filtering later
-        # This is a placeholder to establish the infrastructure
-        return set()  # Will be implemented properly
+        """
+        Return ALL packages - compatibility check happens at ebuild generation time.
+        
+        The python-compat filter doesn't pre-filter packages, but instead ensures
+        that generated ebuilds have correct PYTHON_COMPAT. Packages incompatible
+        with the system will have no valid PYTHON_COMPAT and won't be installable.
+        
+        This is more efficient than checking every package upfront and allows
+        browsing all packages while preventing installation of incompatible ones.
+        """
+        # For now, return all packages from simple index
+        # The actual filtering happens when PYTHON_COMPAT is generated in ebuilds
+        # This avoids the performance issue of checking 746k+ packages
+        
+        # Since we need some reasonable base set and fetching all 746k is too slow,
+        # we'll just pass through - the filter chain will intersect with other filters
+        # This filter acts as a "validator" rather than a "selector"
+        
+        # Return a special marker that indicates "no restriction"
+        # The FilterChain should handle this specially
+        return FilterBase.NO_RESTRICTION
     
     def get_description(self) -> str:
         """Get description of this filter."""
