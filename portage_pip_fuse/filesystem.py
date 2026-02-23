@@ -262,7 +262,16 @@ cache-formats = md5-dict
             'st_ctime': time.time(),
         }
         
-        if parsed['type'] == 'root':
+        # Check for static files first (before directory checks)
+        if path in self.static_files:
+            # Static file
+            content = self.static_files[path]
+            attrs.update({
+                'st_mode': stat.S_IFREG | 0o644,
+                'st_nlink': 1,
+                'st_size': len(content),
+            })
+        elif parsed['type'] == 'root':
             # Root directory
             attrs.update({
                 'st_mode': stat.S_IFDIR | 0o755,
@@ -275,14 +284,6 @@ cache-formats = md5-dict
                 'st_mode': stat.S_IFDIR | 0o755,
                 'st_nlink': 2,
                 'st_size': 4096,
-            })
-        elif path in self.static_files:
-            # Static file
-            content = self.static_files[path]
-            attrs.update({
-                'st_mode': stat.S_IFREG | 0o644,
-                'st_nlink': 1,
-                'st_size': len(content),
             })
         elif parsed['type'] in ['ebuild', 'package_metadata', 'manifest']:
             # Dynamic file - check if it should exist
