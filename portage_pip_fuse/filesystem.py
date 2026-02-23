@@ -212,10 +212,21 @@ cache-formats = md5-dict
             
     def _get_package_versions(self, pypi_name: str) -> List[str]:
         """Get available Gentoo versions for a PyPI package."""
+        # Check if we have cached versions for this package
+        cache_key = f"versions_{pypi_name}"
+        if cache_key in self._metadata_cache:
+            versions, timestamp = self._metadata_cache[cache_key]
+            if time.time() - timestamp < self.cache_ttl:
+                return versions
+            else:
+                del self._metadata_cache[cache_key]
+        
         try:
             # Get raw PyPI JSON data which contains releases
             json_data = self.pypi_extractor.get_package_json(pypi_name)
             if not json_data or 'releases' not in json_data:
+                # Cache empty result to avoid repeated failed lookups
+                self._metadata_cache[cache_key] = ([], time.time())
                 return []
             
             gentoo_versions = []
@@ -228,10 +239,17 @@ cache-formats = md5-dict
                 if gentoo_ver:
                     gentoo_versions.append(gentoo_ver)
                     
-            return sorted(gentoo_versions, reverse=True)  # Newest first
+            sorted_versions = sorted(gentoo_versions, reverse=True)  # Newest first
+            
+            # Cache the versions list
+            self._metadata_cache[cache_key] = (sorted_versions, time.time())
+            
+            return sorted_versions
             
         except Exception as e:
             logger.debug(f"Error getting versions for {pypi_name}: {e}")
+            # Cache empty result to avoid repeated failed lookups
+            self._metadata_cache[cache_key] = ([], time.time())
             return []
         
     def access(self, path, mode):
@@ -304,7 +322,7 @@ cache-formats = md5-dict
                 raise FuseOSError(errno.ENOENT)
                 
             try:
-                # Check if the PyPI package exists
+                # Check if the PyPI package exists (this will use cached versions)
                 versions = self._get_package_versions(pypi_name)
                 if not versions:
                     logger.debug(f"No versions found for PyPI package: {pypi_name}")
