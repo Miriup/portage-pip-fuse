@@ -22,8 +22,9 @@ from portage_pip_fuse.package_filter import FilterRegistry
 
 def signal_handler(signum, frame):
     """Handle termination signals gracefully."""
-    print(f"\nReceived signal {signum}, unmounting...")
-    sys.exit(0)
+    print(f"\nReceived signal {signum}, shutting down...")
+    # Exit cleanly - FUSE will handle unmounting
+    os._exit(0)
 
 
 def validate_mountpoint(path: str) -> Path:
