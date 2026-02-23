@@ -212,17 +212,27 @@ cache-formats = md5-dict
             
     def _get_package_versions(self, pypi_name: str) -> List[str]:
         """Get available Gentoo versions for a PyPI package."""
-        metadata = self._get_package_metadata(pypi_name)
-        if not metadata or 'all_versions' not in metadata:
-            return []
+        try:
+            # Get raw PyPI JSON data which contains releases
+            json_data = self.pypi_extractor.get_package_json(pypi_name)
+            if not json_data or 'releases' not in json_data:
+                return []
             
-        gentoo_versions = []
-        for pypi_ver in metadata['all_versions']:
-            gentoo_ver = self._translate_version(pypi_ver)
-            if gentoo_ver:
-                gentoo_versions.append(gentoo_ver)
-                
-        return sorted(gentoo_versions, reverse=True)  # Newest first
+            gentoo_versions = []
+            for pypi_ver in json_data['releases']:
+                # Skip versions with no files (yanked or empty releases)
+                if not json_data['releases'][pypi_ver]:
+                    continue
+                    
+                gentoo_ver = self._translate_version(pypi_ver)
+                if gentoo_ver:
+                    gentoo_versions.append(gentoo_ver)
+                    
+            return sorted(gentoo_versions, reverse=True)  # Newest first
+            
+        except Exception as e:
+            logger.debug(f"Error getting versions for {pypi_name}: {e}")
+            return []
         
     def access(self, path, mode):
         """Check file access permissions."""
@@ -286,19 +296,33 @@ cache-formats = md5-dict
                 'st_size': 4096,
             })
         elif parsed['type'] in ['ebuild', 'package_metadata', 'manifest']:
-            # Dynamic file - check if it should exist
-            if parsed['type'] == 'ebuild':
-                # Verify that this ebuild version actually exists
-                gentoo_name = parsed['package']
-                pypi_name = self._gentoo_to_pypi(gentoo_name)
-                if pypi_name:
-                    try:
-                        versions = self._get_package_versions(pypi_name)
-                        if parsed['version'] not in versions:
-                            raise FuseOSError(errno.ENOENT)
-                    except Exception:
-                        # If we can't verify, allow it but log debug
-                        logger.debug(f"Cannot verify version for {path}")
+            # Dynamic file - check if it should exist by verifying PyPI package
+            gentoo_name = parsed['package']
+            pypi_name = self._gentoo_to_pypi(gentoo_name)
+            if not pypi_name:
+                logger.debug(f"Cannot translate package name: {gentoo_name}")
+                raise FuseOSError(errno.ENOENT)
+                
+            try:
+                # Check if the PyPI package exists
+                versions = self._get_package_versions(pypi_name)
+                if not versions:
+                    logger.debug(f"No versions found for PyPI package: {pypi_name}")
+                    raise FuseOSError(errno.ENOENT)
+                    
+                # Additional check for ebuild files
+                if parsed['type'] == 'ebuild':
+                    if parsed['version'] not in versions:
+                        logger.debug(f"Version {parsed['version']} not found for {pypi_name}")
+                        raise FuseOSError(errno.ENOENT)
+                        
+            except FuseOSError:
+                # Re-raise FUSE errors
+                raise
+            except Exception as e:
+                # If we can't verify, deny access to prevent broken files
+                logger.debug(f"Cannot verify package {pypi_name}: {e}")
+                raise FuseOSError(errno.ENOENT)
                         
             # File exists, set attributes
             attrs.update({
@@ -351,12 +375,15 @@ cache-formats = md5-dict
             if pypi_name:
                 try:
                     versions = self._get_package_versions(pypi_name)
-                    # Add ebuild files for each version
-                    for version in versions:
-                        entries.append(f"{gentoo_name}-{version}.ebuild")
-                    
-                    # Add metadata files
-                    entries.extend(['metadata.xml', 'Manifest'])
+                    if versions:  # Only list files if package exists on PyPI
+                        # Add ebuild files for each version
+                        for version in versions:
+                            entries.append(f"{gentoo_name}-{version}.ebuild")
+                        
+                        # Add metadata files
+                        entries.extend(['metadata.xml', 'Manifest'])
+                    else:
+                        logger.debug(f"No versions found for {pypi_name}, not listing files")
                 except Exception as e:
                     logger.error(f"Error listing files for {gentoo_name}: {e}")
         
