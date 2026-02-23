@@ -162,6 +162,47 @@ class PyPIMetadataExtractor:
         except (OSError, TypeError) as e:
             logger.warning(f"Failed to cache data for {cache_key}: {e}")
             
+    def _list_cached_packages(self) -> List[str]:
+        """List all cached package names sorted by modification time (most recent first)."""
+        try:
+            package_names = set()
+            
+            # Walk through all subdirectories in cache
+            for subdir in self.cache_dir.iterdir():
+                if not subdir.is_dir():
+                    continue
+                    
+                # Get all JSON cache files in this subdirectory
+                cache_files = list(subdir.glob("*.json"))
+                
+                for cache_file in cache_files:
+                    cache_key = cache_file.stem  # Remove .json extension
+                    
+                    # Extract package name from cache key (cache keys are "package_name" or "package_name_version")
+                    # Look for patterns that suggest this is a versioned cache key
+                    if '_' in cache_key:
+                        parts = cache_key.split('_')
+                        # Try to identify version-like patterns in the last parts
+                        for i in range(len(parts)-1, 0, -1):
+                            potential_version = '_'.join(parts[i:])
+                            # Check if this looks like a version (contains digits and dots/dashes)
+                            if any(c.isdigit() for c in potential_version) and any(c in potential_version for c in '.'):
+                                package_name = '_'.join(parts[:i])
+                                package_names.add(package_name)
+                                break
+                        else:
+                            # No version pattern found, use the whole cache_key as package name
+                            package_names.add(cache_key)
+                    else:
+                        # No underscore, must be just a package name
+                        package_names.add(cache_key)
+            
+            return list(package_names)
+            
+        except Exception as e:
+            logger.warning(f"Error listing cached packages: {e}")
+            return []
+            
     def _get_cached_data(self, package_name: str, version: Optional[str] = None) -> Optional[dict]:
         """Get cached data from memory or disk."""
         cache_key = self._get_cache_key(package_name, version)
@@ -686,35 +727,84 @@ class EbuildDataExtractor:
         """
         Format Python versions for PYTHON_COMPAT variable.
         
+        Only includes Python versions explicitly supported by the package.
+        Does NOT auto-extend to newer versions - that's wrong and can cause build failures.
+        
         Args:
-            python_versions: List of Python version strings
+            python_versions: List of Python version strings from package metadata
             
         Returns:
-            Formatted PYTHON_COMPAT string
+            Formatted PYTHON_COMPAT list containing only supported versions
             
         Examples:
             >>> extractor = EbuildDataExtractor()
-            >>> versions = ['3.8', '3.9', '3.10', '3.11']
+            >>> versions = ['3.8', '3.9', '3.10']
             >>> compat = extractor.format_python_compat(versions)
-            >>> 'python3_8' in compat
-            True
-            >>> 'python3_11' in compat
-            True
-            >>> isinstance(compat, list)
-            True
+            >>> compat
+            ['python3_10', 'python3_8', 'python3_9']
+            >>> 'python3_11' in compat  # Should not auto-extend
+            False
         """
         if not python_versions:
-            # Default to commonly supported versions
-            python_versions = ['3.8', '3.9', '3.10', '3.11', '3.12']
+            # Get system PYTHON_TARGETS as fallback
+            try:
+                import subprocess
+                result = subprocess.run(['portageq', 'envvar', 'PYTHON_TARGETS'], 
+                                      capture_output=True, text=True, check=True)
+                system_targets = result.stdout.strip().split()
+                # Convert to standard format (e.g., python3_11 -> 3.11)
+                fallback_versions = []
+                for target in system_targets:
+                    if target.startswith('python3_'):
+                        minor = target[8:]  # Remove 'python3_'
+                        fallback_versions.append(f'3.{minor}')
+                if fallback_versions:
+                    python_versions = fallback_versions
+                else:
+                    # Ultimate fallback
+                    python_versions = ['3.10', '3.11', '3.12']
+            except Exception:
+                # Ultimate fallback if portageq fails
+                python_versions = ['3.10', '3.11', '3.12']
         
         compat_versions = []
-        for version in python_versions:
-            if '.' in version:
-                major, minor = version.split('.', 1)
-                if major == '3':
-                    compat_versions.append(f'python{major}_{minor}')
         
-        return compat_versions
+        # Only include explicitly supported versions
+        has_generic = False
+        specific_versions = []
+        
+        for version in python_versions:
+            if version == '3':
+                has_generic = True
+            elif '.' in version:
+                major, minor = version.split('.', 1)
+                if major == '3' and minor.isdigit():
+                    minor_int = int(minor)
+                    if minor_int >= 8:  # Only include 3.8+
+                        version_str = f'python{major}_{minor}'
+                        if version_str not in compat_versions:
+                            compat_versions.append(version_str)
+                            specific_versions.append(minor_int)
+        
+        # If we have generic '3' AND specific versions, only use the specific versions
+        # If we have ONLY generic '3', use system targets
+        if has_generic and not specific_versions:
+            # Only generic "3" - use system targets
+            try:
+                import subprocess
+                result = subprocess.run(['portageq', 'envvar', 'PYTHON_TARGETS'], 
+                                      capture_output=True, text=True, check=True)
+                system_targets = result.stdout.strip().split()
+                for target in system_targets:
+                    if target.startswith('python3_') and target not in compat_versions:
+                        compat_versions.append(target)
+            except Exception:
+                # Fallback for generic "3"
+                compat_versions.extend(['python3_10', 'python3_11', 'python3_12'])
+        # If we have both generic '3' and specific versions, ignore the generic '3'
+        
+        # Remove duplicates and sort
+        return sorted(list(set(compat_versions)))
     
     def translate_license(self, pypi_license: str) -> str:
         """
@@ -1058,6 +1148,10 @@ class EbuildDataExtractor:
             >>> ebuild_data['LICENSE']
             'MIT'
         """
+        if package_info is None:
+            logger.error("Cannot prepare ebuild data: package_info is None")
+            return {}
+        
         metadata = package_info.get('metadata', {})
         
         ebuild_data = {
@@ -1086,7 +1180,7 @@ class EbuildDataExtractor:
             ),
             
             # Source information
-            'SRC_URI': package_info.get('source_distribution', {}).get('url', ''),
+            'SRC_URI': (package_info.get('source_distribution') or {}).get('url', ''),
             
             # Additional metadata
             'KEYWORDS': '~amd64 ~x86',  # Default conservative keywords

@@ -17,6 +17,7 @@ import signal
 from pathlib import Path
 
 from portage_pip_fuse.filesystem import mount_filesystem, PortagePipFS
+from portage_pip_fuse.package_filter import FilterRegistry
 
 
 def signal_handler(signum, frame):
@@ -133,6 +134,60 @@ To unmount:
         help='Cache directory for PyPI metadata (default: /tmp/portage-pip-fuse-cache)'
     )
     
+    # Get available filters from registry
+    available_filters = list(FilterRegistry.get_all_filters().keys())
+    default_filters = FilterRegistry.get_default_filters()
+    
+    # Filter configuration arguments
+    parser.add_argument(
+        '--filter',
+        type=str,
+        action='append',
+        choices=available_filters,
+        help=f'Add package filter (available: {", ".join(available_filters)}). Can be used multiple times.'
+    )
+    
+    parser.add_argument(
+        '--no-filter',
+        type=str,
+        action='append',
+        choices=available_filters,
+        help=f'Disable specific filter (available: {", ".join(available_filters)}). Can be used multiple times.'
+    )
+    
+    parser.add_argument(
+        '--deps-for',
+        type=str,
+        action='append',
+        help='Show dependency tree for specified packages (use with --filter=deps)'
+    )
+    
+    parser.add_argument(
+        '--use-flags',
+        type=str,
+        help='Comma-separated Python extras/USE flags for dependency resolution'
+    )
+    
+    parser.add_argument(
+        '--filter-days',
+        type=int,
+        default=30,
+        help='Days to look back for recent packages (default: 30)'
+    )
+    
+    parser.add_argument(
+        '--filter-count',
+        type=int,
+        default=100,
+        help='Number of newest packages to show (default: 100)'
+    )
+    
+    parser.add_argument(
+        '--no-timestamps',
+        action='store_true',
+        help='Disable PyPI timestamp lookup for faster performance (uses current time for all files)'
+    )
+    
     parser.add_argument(
         '--test',
         action='store_true',
@@ -146,6 +201,26 @@ To unmount:
     )
     
     args = parser.parse_args()
+    
+    # Build active filter list
+    active_filters = set(FilterRegistry.get_default_filters())
+    
+    # Add explicitly requested filters
+    if args.filter:
+        active_filters.update(args.filter)
+    
+    # Remove explicitly disabled filters
+    if args.no_filter:
+        active_filters.difference_update(args.no_filter)
+    
+    # Validate filter configuration
+    if 'deps' in active_filters and not args.deps_for:
+        parser.error("Filter 'deps' requires --deps-for to specify packages")
+    
+    # Parse USE flags if provided
+    use_flags = []
+    if args.use_flags:
+        use_flags = [flag.strip() for flag in args.use_flags.split(',')]
     
     # Set up logging
     log_level = logging.DEBUG if args.debug else logging.INFO
@@ -224,8 +299,27 @@ To unmount:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
+    # Build filter configuration dictionary
+    filter_config = {
+        'active_filters': list(active_filters),
+        'deps_for': args.deps_for or [],
+        'use_flags': use_flags,
+        'days': args.filter_days,
+        'count': args.filter_count,
+        'no_timestamps': args.no_timestamps
+    }
+    
     print(f"Mounting portage-pip FUSE filesystem at {mountpoint}")
     print(f"Cache TTL: {args.cache_ttl} seconds")
+    print(f"Active filters: {', '.join(active_filters) if active_filters else 'none'}")
+    
+    if 'deps' in active_filters and args.deps_for:
+        print(f"Showing dependencies for: {', '.join(args.deps_for)}")
+        if use_flags:
+            print(f"With USE flags: {', '.join(use_flags)}")
+    
+    if args.no_timestamps:
+        print("Timestamps disabled for faster performance")
     
     if args.foreground:
         print("Running in foreground (Ctrl+C to unmount)")
@@ -239,7 +333,8 @@ To unmount:
             foreground=args.foreground,
             debug=args.debug,
             cache_ttl=args.cache_ttl,
-            cache_dir=args.cache_dir
+            cache_dir=args.cache_dir,
+            filter_config=filter_config
         )
     except KeyboardInterrupt:
         print("\nUnmounting...")

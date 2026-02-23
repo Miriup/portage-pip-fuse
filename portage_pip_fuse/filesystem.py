@@ -26,6 +26,11 @@ from fuse import FUSE, FuseOSError, Operations
 from .prefetcher import create_prefetched_translator
 from .pip_metadata import PyPIMetadataExtractor, EbuildDataExtractor
 from .prefetcher import PyPIPrefetcher
+from .package_filter import (
+    FilterBase, FilterAll, FilterCurated, FilterRecent, 
+    FilterNewest, FilterDependencyTree, FilterChain, FilterRegistry,
+    FilterSourceDistribution
+)
 
 # Import gs-pypi version parsing
 try:
@@ -60,13 +65,16 @@ class PortagePipFS(Operations):
     - Thin overlay layout with on-demand content generation
     """
     
-    def __init__(self, root: str = "/", cache_ttl: int = 3600, cache_dir: Optional[str] = None):
+    def __init__(self, root: str = "/", cache_ttl: int = 3600, cache_dir: Optional[str] = None, 
+                 filter_config: Optional[Dict] = None):
         """
         Initialize the FUSE filesystem.
         
         Args:
             root: Root directory for the filesystem operations
             cache_ttl: Cache time-to-live in seconds (default: 1 hour)
+            cache_dir: Directory for persistent cache storage
+            filter_config: Package filter configuration dictionary
         """
         self.root = root
         self.cache_ttl = cache_ttl
@@ -97,7 +105,59 @@ class PortagePipFS(Operations):
             "/metadata/layout.conf": self._generate_layout_conf().encode('utf-8')
         }
         
-        logger.info("PortagePipFS initialized with PyPI integration")
+        # Set up package filter based on configuration
+        self.package_filter = self._create_filter(filter_config or {})
+        
+        # Timestamp lookup setting
+        self.no_timestamps = (filter_config or {}).get('no_timestamps', False)
+        
+        logger.info(f"PortagePipFS initialized with filter: {self.package_filter.get_description()}")
+        if self.no_timestamps:
+            logger.info("Timestamp lookup disabled for faster performance")
+        
+    def _create_filter(self, filter_config: Dict) -> FilterBase:
+        """Create package filter based on configuration."""
+        active_filters = filter_config.get('active_filters', ['curated'])
+        
+        if not active_filters:
+            # No filters - return all packages
+            return FilterAll()
+        
+        # Create filter instances
+        filters = []
+        for filter_name in active_filters:
+            filter_class = FilterRegistry.get_filter_class(filter_name)
+            if not filter_class:
+                logger.warning(f"Unknown filter: {filter_name}")
+                continue
+            
+            # Create filter instance with appropriate parameters
+            if filter_name == 'recent':
+                days = filter_config.get('days', 30)
+                filters.append(filter_class(days=days))
+            elif filter_name == 'newest':
+                count = filter_config.get('count', 100)
+                filters.append(filter_class(count=count))
+            elif filter_name == 'deps':
+                deps_for = filter_config.get('deps_for', [])
+                use_flags = filter_config.get('use_flags', [])
+                filters.append(filter_class(
+                    root_packages=deps_for,
+                    use_flags=use_flags,
+                    cache_dir=self.pypi_extractor.cache_dir
+                ))
+            elif filter_name == 'python-compat':
+                filters.append(filter_class(cache_dir=self.pypi_extractor.cache_dir))
+            elif filter_name == 'source-dist':
+                filters.append(filter_class(cache_dir=self.pypi_extractor.cache_dir))
+            else:
+                # Default constructor
+                filters.append(filter_class())
+        
+        if len(filters) == 1:
+            return filters[0]
+        else:
+            return FilterChain(filters, operator='AND')
         
     def _generate_layout_conf(self) -> str:
         """Generate layout.conf for the overlay."""
@@ -263,6 +323,58 @@ cache-formats = md5-dict
             # Cache empty result to avoid repeated failed lookups
             self._metadata_cache[cache_key] = ([], time.time())
             return []
+    
+    def _get_package_upload_time(self, pypi_name: str, pypi_version: Optional[str] = None) -> float:
+        """Get the upload timestamp for a PyPI package or specific version.
+        
+        Args:
+            pypi_name: PyPI package name
+            pypi_version: Optional specific version (uses latest if None)
+            
+        Returns:
+            Unix timestamp of upload time, or current time if not found
+        """
+        try:
+            # Get package JSON data with release info
+            json_data = self.pypi_extractor.get_package_json(pypi_name)
+            if not json_data:
+                return time.time()
+            
+            # If no specific version, use the latest
+            if not pypi_version:
+                pypi_version = json_data.get('info', {}).get('version')
+                if not pypi_version:
+                    return time.time()
+            
+            # Get the release data for this version
+            releases = json_data.get('releases', {})
+            if pypi_version not in releases:
+                return time.time()
+            
+            # Get upload time from the first file in this release
+            version_files = releases[pypi_version]
+            if version_files and len(version_files) > 0:
+                # Parse the upload_time from the first file
+                upload_time_str = version_files[0].get('upload_time')
+                if upload_time_str:
+                    # PyPI provides time in ISO format: "2023-10-15T12:34:56"
+                    from datetime import datetime
+                    try:
+                        dt = datetime.fromisoformat(upload_time_str.replace('Z', '+00:00'))
+                        return dt.timestamp()
+                    except:
+                        # Try alternative parsing
+                        try:
+                            dt = datetime.strptime(upload_time_str, "%Y-%m-%dT%H:%M:%S")
+                            return dt.timestamp()
+                        except:
+                            pass
+            
+            return time.time()
+            
+        except Exception as e:
+            logger.debug(f"Error getting upload time for {pypi_name}: {e}")
+            return time.time()
         
     def access(self, path, mode):
         """Check file access permissions."""
@@ -293,13 +405,16 @@ cache-formats = md5-dict
         """Get file attributes."""
         parsed = self._parse_path(path)
         
+        # Default to current time
+        current_time = time.time()
+        
         # Default attributes
         attrs = {
             'st_uid': os.getuid(),
             'st_gid': os.getgid(),
-            'st_atime': time.time(),
-            'st_mtime': time.time(),
-            'st_ctime': time.time(),
+            'st_atime': current_time,
+            'st_mtime': current_time,
+            'st_ctime': current_time,
         }
         
         # Check for static files first (before directory checks)
@@ -340,13 +455,32 @@ cache-formats = md5-dict
                 })
             else:
                 raise FuseOSError(errno.ENOENT)
-        elif parsed['type'] in ['profiles', 'metadata', 'eclass', 'category', 'package']:
-            # Directory
+        elif parsed['type'] in ['profiles', 'metadata', 'eclass', 'category']:
+            # Static directories - use current time
             attrs.update({
                 'st_mode': stat.S_IFDIR | 0o755,
                 'st_nlink': 2,
                 'st_size': 4096,
             })
+        elif parsed['type'] == 'package':
+            # Package directory - use latest package upload time (unless disabled)
+            gentoo_name = parsed['package']
+            pypi_name = self._gentoo_to_pypi(gentoo_name)
+            if pypi_name and not self.no_timestamps:
+                upload_time = self._get_package_upload_time(pypi_name)
+                attrs.update({
+                    'st_mode': stat.S_IFDIR | 0o755,
+                    'st_nlink': 2,
+                    'st_size': 4096,
+                    'st_mtime': upload_time,
+                    'st_ctime': upload_time,
+                })
+            else:
+                attrs.update({
+                    'st_mode': stat.S_IFDIR | 0o755,
+                    'st_nlink': 2,
+                    'st_size': 4096,
+                })
         elif parsed['type'] in ['ebuild', 'package_metadata', 'manifest']:
             # Dynamic file - check if it should exist by verifying PyPI package
             gentoo_name = parsed['package']
@@ -376,17 +510,52 @@ cache-formats = md5-dict
                 logger.debug(f"Cannot verify package {pypi_name}: {e}")
                 raise FuseOSError(errno.ENOENT)
                         
-            # File exists, set attributes
+            # File exists, set attributes with accurate size
             attrs.update({
                 'st_mode': stat.S_IFREG | 0o644,
                 'st_nlink': 1,
-                'st_size': 2048,  # Default estimate
+                'st_size': 2048,  # Default estimate, will be updated below
             })
             
-            # Try to get actual size from cache
-            cached = self._get_cached_content(path)
-            if cached:
-                attrs['st_size'] = len(cached)
+            # For ebuild files, try to get the specific version's upload time (unless disabled)
+            if parsed['type'] == 'ebuild' and pypi_name and not self.no_timestamps:
+                # Need to convert Gentoo version back to PyPI version
+                # This is a simplified reverse translation
+                gentoo_ver = parsed['version']
+                pypi_ver = gentoo_ver.replace('_alpha', 'a').replace('_beta', 'b').replace('_rc', 'rc')
+                pypi_ver = pypi_ver.replace('_p', '.post').replace('.9999.', '.dev')
+                
+                upload_time = self._get_package_upload_time(pypi_name, pypi_ver)
+                attrs['st_mtime'] = upload_time
+                attrs['st_ctime'] = upload_time
+            elif pypi_name and not self.no_timestamps:
+                # For other files (metadata.xml, Manifest), use latest package time
+                upload_time = self._get_package_upload_time(pypi_name)
+                attrs['st_mtime'] = upload_time
+                attrs['st_ctime'] = upload_time
+            
+            # Get actual size by generating content
+            # This ensures vim and other tools see the correct file size
+            try:
+                if parsed['type'] == 'ebuild':
+                    content = self._generate_ebuild(pypi_name, parsed['version'])
+                    attrs['st_size'] = len(content.encode('utf-8'))
+                elif parsed['type'] == 'package_metadata':
+                    content = self._generate_metadata_xml(pypi_name)
+                    attrs['st_size'] = len(content.encode('utf-8'))
+                elif parsed['type'] == 'manifest':
+                    content = self._generate_manifest(pypi_name, parsed['version'])
+                    attrs['st_size'] = len(content.encode('utf-8'))
+                else:
+                    # Try to get cached content as fallback
+                    cached = self._get_cached_content(path)
+                    if cached:
+                        attrs['st_size'] = len(cached)
+            except Exception as e:
+                # If content generation fails, use the default estimate
+                # This is better than failing completely
+                logger.debug(f"Could not determine accurate size for {path}: {e}")
+                # Keep the default 2048 estimate
         elif parsed['type'] == 'invalid':
             # Invalid path - return ENOENT  
             raise FuseOSError(errno.ENOENT)
@@ -417,17 +586,32 @@ cache-formats = md5-dict
             pass
             
         elif parsed['type'] == 'category' and parsed['category'] == 'dev-python':
-            # List available PyPI packages from the name translator cache
+            # Use the configured filter to get packages
             try:
-                # Get list of Gentoo package names from the prefetched mappings
-                if hasattr(self.name_translator, '_preferred_pypi'):
-                    gentoo_packages = list(self.name_translator._preferred_pypi.keys())
-                    entries.extend(gentoo_packages)
-                    logger.debug(f"Found {len(gentoo_packages)} PyPI packages in cache")
-                else:
-                    logger.warning("Name translator doesn't have package cache")
+                import time
+                start_time = time.time()
+                
+                logger.info(f"Listing packages using filter: {self.package_filter.get_description()}")
+                
+                # Get PyPI packages from the filter
+                pypi_packages = self.package_filter.get_packages()
+                
+                # Convert PyPI names to Gentoo names
+                gentoo_packages = []
+                for pypi_name in pypi_packages:
+                    gentoo_name = self.name_translator.pypi_to_gentoo(pypi_name)
+                    if gentoo_name:
+                        gentoo_packages.append(gentoo_name)
+                
+                entries.extend(sorted(gentoo_packages))
+                
+                elapsed = time.time() - start_time
+                logger.info(f"Listed {len(gentoo_packages)} packages in {elapsed:.2f} seconds")
+                
             except Exception as e:
-                logger.error(f"Error listing PyPI packages: {e}")
+                logger.error(f"Error listing packages: {e}")
+                # Fallback to empty list on error
+                logger.warning("Package listing failed, returning empty directory")
             
         elif parsed['type'] == 'package':
             # List versions and files for a package
@@ -565,6 +749,9 @@ cache-formats = md5-dict
                 
             # Prepare ebuild data
             ebuild_data = self.ebuild_extractor.prepare_ebuild_data(version_metadata)
+            if not ebuild_data:
+                logger.error(f"Failed to prepare ebuild data for {package}-{version}")
+                return None
             
             # Generate ebuild from template
             return self._format_ebuild(ebuild_data)
@@ -582,7 +769,7 @@ cache-formats = md5-dict
             f"EAPI=8",
             f"",
             f"DISTUTILS_USE_PEP517=standalone",
-            f"PYTHON_COMPAT=( {' '.join(data.get('PYTHON_COMPAT', ['python3_8', 'python3_9', 'python3_10', 'python3_11']))} )",
+            f"PYTHON_COMPAT=( {' '.join(data.get('PYTHON_COMPAT', ['python3_8', 'python3_9', 'python3_10', 'python3_11', 'python3_12']))} )",
             f"",
             f"inherit distutils-r1 pypi",
             f"",
@@ -688,7 +875,9 @@ cache-formats = md5-dict
         return '\n'.join(manifest_lines) + ('\n' if manifest_lines else '')
 
 
-def mount_filesystem(mountpoint: str, foreground: bool = False, debug: bool = False, cache_ttl: int = 3600, cache_dir: Optional[str] = None):
+def mount_filesystem(mountpoint: str, foreground: bool = False, debug: bool = False, 
+                    cache_ttl: int = 3600, cache_dir: Optional[str] = None, 
+                    filter_config: Optional[Dict] = None):
     """
     Mount the portage-pip FUSE filesystem.
     
@@ -698,6 +887,7 @@ def mount_filesystem(mountpoint: str, foreground: bool = False, debug: bool = Fa
         debug: Enable debug output
         cache_ttl: Cache time-to-live in seconds (default: 1 hour)
         cache_dir: Cache directory for PyPI metadata (default: system temp)
+        filter_config: Package filter configuration dictionary
     """
     # Only configure logging if it hasn't been configured yet (no handlers exist)
     if not logging.getLogger().handlers:
@@ -707,5 +897,5 @@ def mount_filesystem(mountpoint: str, foreground: bool = False, debug: bool = Fa
             logging.basicConfig(level=logging.INFO)
         
     logger.info(f"Mounting portage-pip FUSE filesystem at {mountpoint}")
-    fs = PortagePipFS(cache_ttl=cache_ttl, cache_dir=cache_dir)
+    fs = PortagePipFS(cache_ttl=cache_ttl, cache_dir=cache_dir, filter_config=filter_config)
     FUSE(fs, mountpoint, nothreads=True, foreground=foreground, debug=debug)
