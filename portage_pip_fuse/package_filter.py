@@ -256,7 +256,7 @@ class FilterDependencyTree(FilterBase):
             return visited
             
         # Parse dependencies
-        requires_dist = metadata.get('info', {}).get('requires_dist', [])
+        requires_dist = metadata.get('info', {}).get('requires_dist', []) or []
         
         for req_str in requires_dist:
             try:
