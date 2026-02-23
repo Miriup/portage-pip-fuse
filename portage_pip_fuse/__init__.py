@@ -20,6 +20,11 @@ from portage_pip_fuse.name_translator import (
     pypi_to_gentoo,
     gentoo_to_pypi,
 )
+from portage_pip_fuse.prefetcher import (
+    RepositoryScanner,
+    PyPIPrefetcher,
+    create_prefetched_translator,
+)
 
 __all__ = [
     "PortagePipFS",
@@ -27,5 +32,8 @@ __all__ = [
     "CachedNameTranslator",
     "pypi_to_gentoo",
     "gentoo_to_pypi",
+    "RepositoryScanner",
+    "PyPIPrefetcher",
+    "create_prefetched_translator",
     "__version__",
 ]
