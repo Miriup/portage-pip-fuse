@@ -653,6 +653,34 @@ class EbuildDataExtractor:
     def __init__(self):
         """Initialize the ebuild data extractor."""
         self.pypi_extractor = PyPIMetadataExtractor()
+        
+        # PyPI to Gentoo license mapping
+        self.license_map = {
+            'MIT': 'MIT',
+            'MIT License': 'MIT', 
+            'Apache-2.0': 'Apache-2.0',
+            'Apache 2.0': 'Apache-2.0',
+            'Apache License 2.0': 'Apache-2.0',
+            'Apache Software License': 'Apache-2.0',
+            'BSD': 'BSD',
+            'BSD License': 'BSD',
+            'BSD-2-Clause': 'BSD-2',
+            'BSD-3-Clause': 'BSD',
+            'GPL-2.0': 'GPL-2',
+            'GPL-3.0': 'GPL-3', 
+            'GPL-2.0+': 'GPL-2+',
+            'GPL-3.0+': 'GPL-3+',
+            'GNU General Public License v2': 'GPL-2+',
+            'GNU General Public License v3': 'GPL-3+',
+            'PSF-2.0': 'PSF-2',
+            'Python Software Foundation License': 'PSF-2',
+            'LGPL-2.1': 'LGPL-2.1',
+            'LGPL-3.0': 'LGPL-3',
+            'ISC': 'ISC',
+            'MPL-2.0': 'MPL-2.0',
+            'CC0-1.0': 'CC0-1.0',
+            'Unlicense': 'Unlicense',
+        }
     
     def format_python_compat(self, python_versions: List[str]) -> str:
         """
@@ -672,7 +700,7 @@ class EbuildDataExtractor:
             True
             >>> 'python3_11' in compat
             True
-            >>> compat.startswith('(') and compat.endswith(')')
+            >>> isinstance(compat, list)
             True
         """
         if not python_versions:
@@ -686,7 +714,87 @@ class EbuildDataExtractor:
                 if major == '3':
                     compat_versions.append(f'python{major}_{minor}')
         
-        return '( ' + ' '.join(compat_versions) + ' )'
+        return compat_versions
+    
+    def translate_license(self, pypi_license: str) -> str:
+        """
+        Translate PyPI license string to Gentoo license format.
+        
+        Args:
+            pypi_license: License string from PyPI metadata
+            
+        Returns:
+            Gentoo-compatible license string
+            
+        Examples:
+            >>> extractor = EbuildDataExtractor()
+            >>> extractor.translate_license('MIT')
+            'MIT'
+            >>> extractor.translate_license('Apache-2.0')
+            'Apache-2.0'
+            >>> extractor.translate_license('Unknown License')
+            'all-rights-reserved'
+            >>> extractor.translate_license('')
+            'all-rights-reserved'
+            >>> extractor.translate_license('BSD-3-Clause')
+            'BSD'
+            >>> extractor.translate_license('BSD-2-Clause')
+            'BSD-2'
+            >>> extractor.translate_license('GNU General Public License v3')
+            'GPL-3+'
+            >>> extractor.translate_license('python software foundation')
+            'PSF-2'
+            >>> extractor.translate_license('GPL v2 or later')
+            'GPL-2+'
+            >>> extractor.translate_license('some weird mit license')
+            'MIT'
+        """
+        if not pypi_license:
+            return 'all-rights-reserved'
+            
+        # Direct mapping
+        if pypi_license in self.license_map:
+            return self.license_map[pypi_license]
+        
+        # Case-insensitive partial matching for common cases
+        pypi_lower = pypi_license.lower()
+        
+        if 'mit' in pypi_lower:
+            return 'MIT'
+        elif 'apache' in pypi_lower and '2' in pypi_lower:
+            return 'Apache-2.0'
+        elif 'bsd' in pypi_lower:
+            if '2' in pypi_lower:
+                return 'BSD-2'
+            else:
+                return 'BSD'
+        elif 'gpl' in pypi_lower:
+            if '3' in pypi_lower:
+                return 'GPL-3+' if '+' in pypi_lower or 'later' in pypi_lower else 'GPL-3'
+            elif '2' in pypi_lower:
+                return 'GPL-2+' if '+' in pypi_lower or 'later' in pypi_lower else 'GPL-2'
+            else:
+                return 'GPL-3+'  # Default to GPL-3+ for unspecified GPL
+        elif 'lgpl' in pypi_lower:
+            if '2.1' in pypi_lower:
+                return 'LGPL-2.1'
+            elif '3' in pypi_lower:
+                return 'LGPL-3'
+            else:
+                return 'LGPL-2.1'  # Default to 2.1
+        elif 'python' in pypi_lower or 'psf' in pypi_lower:
+            return 'PSF-2'
+        elif 'isc' in pypi_lower:
+            return 'ISC'
+        elif 'mozilla' in pypi_lower or 'mpl' in pypi_lower:
+            return 'MPL-2.0'
+        elif 'unlicense' in pypi_lower:
+            return 'Unlicense'
+        elif 'cc0' in pypi_lower:
+            return 'CC0-1.0'
+        else:
+            # Unknown license - use all-rights-reserved per Gentoo policy
+            return 'all-rights-reserved'
     
     def format_dependencies(self, dependencies: List[str]) -> List[str]:
         """
@@ -836,8 +944,29 @@ class EbuildDataExtractor:
             
         Examples:
             >>> extractor = EbuildDataExtractor()
-            >>> # This would be called internally, but for demonstration:
-            >>> # specifiers like '>=6.0.0' become '>=dev-python/pytest-6.0.0'
+            >>> # Test by parsing actual requirement strings
+            >>> try:
+            ...     from pip._vendor.packaging.requirements import Requirement
+            ... except ImportError:
+            ...     from packaging.requirements import Requirement
+            >>> # Test ~= compatible release operator (PEP 440)
+            >>> req = Requirement('requests~=1.4')
+            >>> result = extractor._format_gentoo_dependency('requests', req.specifier)
+            >>> '>=dev-python/requests-1.4' in result
+            True
+            >>> '<dev-python/requests-2' in result
+            True
+            >>> # Test ~= with patch version
+            >>> req = Requirement('requests~=1.4.2')
+            >>> result = extractor._format_gentoo_dependency('requests', req.specifier)
+            >>> '>=dev-python/requests-1.4.2' in result
+            True
+            >>> '<dev-python/requests-1.5' in result
+            True
+            >>> # Test simple >= operator
+            >>> req = Requirement('requests>=2.0.0')
+            >>> extractor._format_gentoo_dependency('requests', req.specifier)
+            '>=dev-python/requests-2.0.0'
         """
         if not specifiers:
             return f"dev-python/{gentoo_name}"
@@ -922,6 +1051,12 @@ class EbuildDataExtractor:
             '1.0.0'
             >>> 'python3_8' in ebuild_data['PYTHON_COMPAT']
             True
+            >>> ebuild_data['PYPI_PN']
+            'example-package'
+            >>> ebuild_data['PYPI_PV']
+            '1.0.0'
+            >>> ebuild_data['LICENSE']
+            'MIT'
         """
         metadata = package_info.get('metadata', {})
         
@@ -931,7 +1066,11 @@ class EbuildDataExtractor:
             'PV': metadata.get('version', ''),
             'DESCRIPTION': metadata.get('summary', ''),
             'HOMEPAGE': metadata.get('homepage', ''),
-            'LICENSE': metadata.get('license', ''),
+            'LICENSE': self.translate_license(metadata.get('license', '')),
+            
+            # PyPI eclass variables
+            'PYPI_PN': metadata.get('name', ''),
+            'PYPI_PV': metadata.get('version', ''),
             
             # Python compatibility
             'PYTHON_COMPAT': self.format_python_compat(

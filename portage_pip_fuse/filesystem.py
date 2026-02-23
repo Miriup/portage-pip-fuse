@@ -117,9 +117,21 @@ cache-formats = md5-dict
         parts = path.split('/')
         
         if parts[0] == 'profiles':
-            return {'type': 'profiles', 'filename': parts[-1] if len(parts) > 1 else None}
+            if len(parts) == 1:
+                return {'type': 'profiles'}
+            elif len(parts) == 2 and parts[1] == 'repo_name':
+                return {'type': 'profiles_file', 'filename': 'repo_name'}
+            else:
+                # Invalid profiles path - return not found
+                return {'type': 'invalid'}
         elif parts[0] == 'metadata':
-            return {'type': 'metadata', 'filename': parts[-1] if len(parts) > 1 else None}
+            if len(parts) == 1:
+                return {'type': 'metadata'}
+            elif len(parts) == 2 and parts[1] == 'layout.conf':
+                return {'type': 'metadata_file', 'filename': 'layout.conf'}
+            else:
+                # Invalid metadata path - return not found
+                return {'type': 'invalid'}
         elif parts[0] == 'eclass':
             return {'type': 'eclass', 'filename': parts[-1] if len(parts) > 1 else None}
         elif parts[0] == 'dev-python' and len(parts) == 1:
@@ -306,6 +318,28 @@ cache-formats = md5-dict
                 'st_nlink': 2,
                 'st_size': 4096,
             })
+        elif parsed['type'] == 'profiles_file':
+            # Static profiles files
+            if parsed['filename'] == 'repo_name':
+                content = b"portage-pip-fuse\n"
+                attrs.update({
+                    'st_mode': stat.S_IFREG | 0o644,
+                    'st_nlink': 1,
+                    'st_size': len(content),
+                })
+            else:
+                raise FuseOSError(errno.ENOENT)
+        elif parsed['type'] == 'metadata_file':
+            # Static metadata files
+            if parsed['filename'] == 'layout.conf':
+                content = self._generate_layout_conf().encode('utf-8')
+                attrs.update({
+                    'st_mode': stat.S_IFREG | 0o644,
+                    'st_nlink': 1,
+                    'st_size': len(content),
+                })
+            else:
+                raise FuseOSError(errno.ENOENT)
         elif parsed['type'] in ['profiles', 'metadata', 'eclass', 'category', 'package']:
             # Directory
             attrs.update({
@@ -353,6 +387,9 @@ cache-formats = md5-dict
             cached = self._get_cached_content(path)
             if cached:
                 attrs['st_size'] = len(cached)
+        elif parsed['type'] == 'invalid':
+            # Invalid path - return ENOENT  
+            raise FuseOSError(errno.ENOENT)
         else:
             # Unknown path type - this is normal for filesystem exploration
             logger.debug(f"Path not found: {path} (type: {parsed['type']})")
@@ -380,10 +417,17 @@ cache-formats = md5-dict
             pass
             
         elif parsed['type'] == 'category' and parsed['category'] == 'dev-python':
-            # List available PyPI packages
-            # For now, return packages that are requested (they'll be created dynamically)
-            # In a full implementation, this could scan a pre-populated list
-            pass
+            # List available PyPI packages from the name translator cache
+            try:
+                # Get list of Gentoo package names from the prefetched mappings
+                if hasattr(self.name_translator, '_preferred_pypi'):
+                    gentoo_packages = list(self.name_translator._preferred_pypi.keys())
+                    entries.extend(gentoo_packages)
+                    logger.debug(f"Found {len(gentoo_packages)} PyPI packages in cache")
+                else:
+                    logger.warning("Name translator doesn't have package cache")
+            except Exception as e:
+                logger.error(f"Error listing PyPI packages: {e}")
             
         elif parsed['type'] == 'package':
             # List versions and files for a package
@@ -414,6 +458,15 @@ cache-formats = md5-dict
             content = self.static_files[path]
             return content[offset:offset + length]
         
+        # Check static files  
+        parsed = self._parse_path(path)
+        if parsed['type'] == 'profiles_file' and parsed['filename'] == 'repo_name':
+            content = b"portage-pip-fuse\n"
+            return content[offset:offset + length]
+        elif parsed['type'] == 'metadata_file' and parsed['filename'] == 'layout.conf':
+            content = self._generate_layout_conf().encode('utf-8')
+            return content[offset:offset + length]
+        
         # Try cache
         content = self._get_cached_content(path)
         if content is None:
@@ -437,7 +490,10 @@ cache-formats = md5-dict
             
         # Check if it's a valid dynamic file
         parsed = self._parse_path(path)
-        if parsed['type'] in ['ebuild', 'package_metadata', 'manifest']:
+        if parsed['type'] in ['profiles_file', 'metadata_file']:
+            # Allow opening static files
+            return 0
+        elif parsed['type'] in ['ebuild', 'package_metadata', 'manifest']:
             # Additional verification for ebuilds
             if parsed['type'] == 'ebuild':
                 gentoo_name = parsed['package']
@@ -529,6 +585,9 @@ cache-formats = md5-dict
             f"PYTHON_COMPAT=( {' '.join(data.get('PYTHON_COMPAT', ['python3_8', 'python3_9', 'python3_10', 'python3_11']))} )",
             f"",
             f"inherit distutils-r1 pypi",
+            f"",
+            f"PYPI_PN=\"{data.get('PYPI_PN', data.get('PN', ''))}\"",
+            f"PYPI_PV=\"{data.get('PYPI_PV', data.get('PV', ''))}\"",
             f"",
             f"DESCRIPTION=\"{data.get('DESCRIPTION', 'Python package from PyPI')}\"",
             f"HOMEPAGE=\"{data.get('HOMEPAGE', 'https://pypi.org/project/' + data.get('PN', ''))}\"",
@@ -640,10 +699,12 @@ def mount_filesystem(mountpoint: str, foreground: bool = False, debug: bool = Fa
         cache_ttl: Cache time-to-live in seconds (default: 1 hour)
         cache_dir: Cache directory for PyPI metadata (default: system temp)
     """
-    if debug:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
+    # Only configure logging if it hasn't been configured yet (no handlers exist)
+    if not logging.getLogger().handlers:
+        if debug:
+            logging.basicConfig(level=logging.DEBUG)
+        else:
+            logging.basicConfig(level=logging.INFO)
         
     logger.info(f"Mounting portage-pip FUSE filesystem at {mountpoint}")
     fs = PortagePipFS(cache_ttl=cache_ttl, cache_dir=cache_dir)
