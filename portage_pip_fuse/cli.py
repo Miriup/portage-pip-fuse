@@ -2,6 +2,9 @@
 """
 Command-line interface for portage-pip-fuse.
 
+This module provides the main CLI entry point for mounting and managing
+the PyPI-to-Gentoo FUSE filesystem.
+
 Copyright (C) 2026 Dirk Tilger <dirk@systemication.com>
 Licensed under GPL-2.0
 """
@@ -10,63 +13,245 @@ import argparse
 import logging
 import os
 import sys
+import signal
+from pathlib import Path
 
-from portage_pip_fuse.filesystem import mount_filesystem
+from portage_pip_fuse.filesystem import mount_filesystem, PortagePipFS
+
+
+def signal_handler(signum, frame):
+    """Handle termination signals gracefully."""
+    print(f"\nReceived signal {signum}, unmounting...")
+    sys.exit(0)
+
+
+def validate_mountpoint(path: str) -> Path:
+    """Validate and prepare mountpoint."""
+    mountpoint = Path(path).resolve()
+    
+    # Check if mountpoint exists
+    if not mountpoint.exists():
+        print(f"Creating mountpoint: {mountpoint}")
+        try:
+            mountpoint.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            print(f"Error: Permission denied creating {mountpoint}")
+            print("Try running with sudo or choose a different location")
+            sys.exit(1)
+    
+    # Check if it's a directory
+    if not mountpoint.is_dir():
+        print(f"Error: {mountpoint} is not a directory")
+        sys.exit(1)
+    
+    # Check if directory is empty
+    try:
+        if any(mountpoint.iterdir()):
+            print(f"Warning: {mountpoint} is not empty")
+            response = input("Continue anyway? [y/N]: ")
+            if response.lower() not in ['y', 'yes']:
+                sys.exit(0)
+    except PermissionError:
+        print(f"Error: Permission denied accessing {mountpoint}")
+        sys.exit(1)
+    
+    return mountpoint
+
+
+def check_fuse_availability():
+    """Check if FUSE is available on the system."""
+    try:
+        import fuse
+    except ImportError:
+        print("Error: Python FUSE library not found")
+        print("Install with: pip install fusepy")
+        sys.exit(1)
+    
+    # Check if /dev/fuse exists
+    if not os.path.exists('/dev/fuse'):
+        print("Error: FUSE not available on this system")
+        print("Make sure FUSE kernel module is loaded: modprobe fuse")
+        sys.exit(1)
 
 
 def main():
-    """Main entry point for the CLI."""
+    """Main CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="FUSE filesystem adapter between pip and portage"
+        prog='portage-pip-fuse',
+        description='Mount a FUSE filesystem that bridges PyPI packages to Gentoo portage',
+        epilog='''
+Examples:
+  %(prog)s /mnt/pypi                           # Mount with defaults
+  %(prog)s /mnt/pypi -f                        # Mount in foreground
+  %(prog)s /mnt/pypi -f -d                     # Mount with debug output
+  %(prog)s /mnt/pypi -d --logfile /var/log/pypi.log  # Debug to logfile
+  %(prog)s /mnt/pypi --cache-ttl 600           # Mount with 10-minute cache
+  
+After mounting, you can:
+  ls /mnt/pypi/dev-python/requests
+  cat /mnt/pypi/dev-python/requests/requests-2.28.1.ebuild
+  
+To unmount:
+  fusermount -u /mnt/pypi
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    
     parser.add_argument(
-        "mountpoint",
-        help="Mount point for the FUSE filesystem"
+        'mountpoint',
+        help='Directory where the filesystem will be mounted'
     )
+    
     parser.add_argument(
-        "-f", "--foreground",
-        action="store_true",
-        help="Run in foreground (don't daemonize)"
+        '-f', '--foreground',
+        action='store_true',
+        help='Run in foreground instead of daemonizing'
     )
+    
     parser.add_argument(
-        "-d", "--debug",
-        action="store_true",
-        help="Enable debug output"
+        '-d', '--debug',
+        action='store_true',
+        help='Enable debug output'
     )
+    
     parser.add_argument(
-        "-v", "--version",
-        action="version",
-        version="%(prog)s 0.1.0"
+        '--logfile',
+        type=str,
+        help='Log file path for debug output (default: stderr)'
+    )
+    
+    parser.add_argument(
+        '--cache-ttl',
+        type=int,
+        default=3600,
+        help='Cache time-to-live in seconds (default: 3600)'
+    )
+    
+    parser.add_argument(
+        '--cache-dir',
+        type=str,
+        help='Cache directory for PyPI metadata (default: /tmp/portage-pip-fuse-cache)'
+    )
+    
+    parser.add_argument(
+        '--test',
+        action='store_true',
+        help='Run filesystem tests without mounting'
+    )
+    
+    parser.add_argument(
+        '--version',
+        action='version',
+        version='%(prog)s 0.1.0'
     )
     
     args = parser.parse_args()
     
+    # Set up logging
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    
+    # Configure logging with optional file output
+    if args.logfile:
+        # Validate logfile path
+        logfile_path = Path(args.logfile).resolve()
+        
+        # Create log directory if needed
+        try:
+            logfile_path.parent.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            print(f"Error: Cannot create log directory {logfile_path.parent}")
+            return 1
+        
+        # Set up file logging
+        logging.basicConfig(
+            level=log_level,
+            format=log_format,
+            filename=str(logfile_path),
+            filemode='a'  # Append mode
+        )
+        
+        # Also add console output for important messages
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.WARNING)
+        console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+        console_handler.setFormatter(console_formatter)
+        logging.getLogger().addHandler(console_handler)
+        
+        print(f"Logging to file: {logfile_path}")
+        
+    else:
+        # Standard logging to stderr
+        logging.basicConfig(
+            level=log_level,
+            format=log_format
+        )
+    
+    logger = logging.getLogger(__name__)
+    
+    if args.test:
+        # Run tests
+        print("Running portage-pip-fuse tests...")
+        try:
+            fs = PortagePipFS(cache_ttl=args.cache_ttl, cache_dir=args.cache_dir)
+            print("✓ Filesystem initialization successful")
+            
+            # Test path parsing
+            test_paths = [
+                "/dev-python/requests",
+                "/dev-python/requests/requests-2.28.1.ebuild",
+                "/profiles/repo_name"
+            ]
+            
+            for path in test_paths:
+                parsed = fs._parse_path(path)
+                print(f"✓ Path parsing: {path} -> {parsed['type']}")
+            
+            print("All tests passed!")
+            return 0
+            
+        except Exception as e:
+            print(f"✗ Test failed: {e}")
+            return 1
+    
+    # Check system requirements
+    check_fuse_availability()
+    
     # Validate mountpoint
-    if not os.path.exists(args.mountpoint):
-        print(f"Error: Mountpoint '{args.mountpoint}' does not exist", file=sys.stderr)
-        sys.exit(1)
-        
-    if not os.path.isdir(args.mountpoint):
-        print(f"Error: Mountpoint '{args.mountpoint}' is not a directory", file=sys.stderr)
-        sys.exit(1)
-        
-    # Check if mountpoint is empty
-    if os.listdir(args.mountpoint):
-        print(f"Warning: Mountpoint '{args.mountpoint}' is not empty", file=sys.stderr)
-        
+    mountpoint = validate_mountpoint(args.mountpoint)
+    
+    # Set up signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    print(f"Mounting portage-pip FUSE filesystem at {mountpoint}")
+    print(f"Cache TTL: {args.cache_ttl} seconds")
+    
+    if args.foreground:
+        print("Running in foreground (Ctrl+C to unmount)")
+    else:
+        print("Running in background")
+        print(f"To unmount: fusermount -u {mountpoint}")
+    
     try:
-        print(f"Mounting portage-pip-fuse at {args.mountpoint}...")
         mount_filesystem(
-            mountpoint=args.mountpoint,
+            str(mountpoint),
             foreground=args.foreground,
-            debug=args.debug
+            debug=args.debug,
+            cache_ttl=args.cache_ttl,
+            cache_dir=args.cache_dir
         )
     except KeyboardInterrupt:
         print("\nUnmounting...")
-        sys.exit(0)
+    except PermissionError:
+        print("Error: Permission denied")
+        print("Try running with sudo or check FUSE permissions")
+        return 1
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        logger.error(f"Mount failed: {e}")
+        return 1
+    
+    return 0
 
 
 if __name__ == "__main__":

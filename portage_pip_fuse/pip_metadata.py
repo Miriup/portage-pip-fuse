@@ -10,9 +10,13 @@ Licensed under GPL-2.0
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
+import tempfile
+import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from urllib.parse import urlparse
 
@@ -55,18 +59,125 @@ class PyPIMetadataExtractor:
     
     def __init__(self, 
                  session_timeout: int = 30,
-                 user_agent: str = "portage-pip-fuse/0.1.0"):
+                 user_agent: str = "portage-pip-fuse/0.1.0",
+                 cache_ttl: int = 3600,
+                 cache_dir: Optional[str] = None):
         """
         Initialize the metadata extractor.
         
         Args:
             session_timeout: HTTP session timeout in seconds
             user_agent: User agent string for HTTP requests
+            cache_ttl: Cache time-to-live in seconds (default: 1 hour)
+            cache_dir: Directory for persistent cache (default: system temp)
         """
         self.timeout = session_timeout
+        self.session_timeout = session_timeout  # For backwards compatibility
         self.user_agent = user_agent
-        self.session_timeout = session_timeout
+        self.cache_ttl = cache_ttl
+        
+        # Set up cache directory
+        if cache_dir is None:
+            cache_dir = os.path.join(tempfile.gettempdir(), 'portage-pip-fuse-cache')
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # In-memory cache: package_name -> (data, timestamp)
+        self._memory_cache: Dict[str, Tuple[dict, float]] = {}
         self._session = None
+        
+        logger.info(f"PyPI metadata cache initialized at {self.cache_dir}")
+        
+    def _get_cache_key(self, package_name: str, version: Optional[str] = None) -> str:
+        """Generate cache key for package metadata."""
+        if version:
+            return f"{package_name.lower()}_{version}"
+        return package_name.lower()
+        
+    def _get_cache_path(self, cache_key: str) -> Path:
+        """Get filesystem path for cache key."""
+        # Use first two characters for subdirectory to avoid too many files in one dir
+        subdir = cache_key[:2] if len(cache_key) >= 2 else '00'
+        cache_subdir = self.cache_dir / subdir
+        cache_subdir.mkdir(exist_ok=True)
+        return cache_subdir / f"{cache_key}.json"
+        
+    def _get_memory_cache(self, cache_key: str) -> Optional[dict]:
+        """Get data from in-memory cache if valid."""
+        if cache_key in self._memory_cache:
+            data, timestamp = self._memory_cache[cache_key]
+            if time.time() - timestamp < self.cache_ttl:
+                return data
+            else:
+                # Expired, remove from memory cache
+                del self._memory_cache[cache_key]
+        return None
+        
+    def _set_memory_cache(self, cache_key: str, data: dict):
+        """Store data in in-memory cache."""
+        self._memory_cache[cache_key] = (data, time.time())
+        
+    def _get_disk_cache(self, cache_key: str) -> Optional[dict]:
+        """Get data from disk cache if valid."""
+        cache_path = self._get_cache_path(cache_key)
+        
+        if not cache_path.exists():
+            return None
+            
+        try:
+            # Check if cache is still valid
+            if time.time() - cache_path.stat().st_mtime > self.cache_ttl:
+                # Cache expired, remove file
+                cache_path.unlink(missing_ok=True)
+                return None
+                
+            # Load cached data
+            with cache_path.open('r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            # Also populate memory cache
+            self._set_memory_cache(cache_key, data)
+            return data
+            
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            logger.warning(f"Failed to load cache for {cache_key}: {e}")
+            # Remove corrupted cache file
+            cache_path.unlink(missing_ok=True)
+            return None
+            
+    def _set_disk_cache(self, cache_key: str, data: dict):
+        """Store data in disk cache."""
+        cache_path = self._get_cache_path(cache_key)
+        
+        try:
+            # Write to temporary file first, then rename for atomicity
+            temp_path = cache_path.with_suffix('.tmp')
+            with temp_path.open('w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            temp_path.rename(cache_path)
+            
+            # Also store in memory cache
+            self._set_memory_cache(cache_key, data)
+            
+        except (OSError, TypeError) as e:
+            logger.warning(f"Failed to cache data for {cache_key}: {e}")
+            
+    def _get_cached_data(self, package_name: str, version: Optional[str] = None) -> Optional[dict]:
+        """Get cached data from memory or disk."""
+        cache_key = self._get_cache_key(package_name, version)
+        
+        # Try memory cache first (fastest)
+        data = self._get_memory_cache(cache_key)
+        if data is not None:
+            return data
+            
+        # Try disk cache
+        return self._get_disk_cache(cache_key)
+        
+    def _cache_data(self, package_name: str, data: dict, version: Optional[str] = None):
+        """Cache data to both memory and disk."""
+        cache_key = self._get_cache_key(package_name, version)
+        self._set_disk_cache(cache_key, data)
         
     def _get_session(self):
         """Get or create HTTP session for PyPI requests."""
@@ -486,6 +597,12 @@ class PyPIMetadataExtractor:
             >>> info is None
             True
         """
+        # Check cache first
+        cached_data = self._get_cached_data(package_name, version)
+        if cached_data is not None:
+            logger.debug(f"Using cached data for {package_name} {version or 'latest'}")
+            return cached_data
+        
         # Get JSON metadata
         package_json = self.get_package_json(package_name, version)
         if not package_json:
@@ -513,6 +630,10 @@ class PyPIMetadataExtractor:
         if sdist:
             manifest_entry = self.generate_manifest_entry(sdist)
             complete_info['manifest_entry'] = manifest_entry
+        
+        # Cache the complete information
+        self._cache_data(package_name, complete_info, version)
+        logger.debug(f"Cached metadata for {package_name} {version or 'latest'}")
         
         return complete_info
 

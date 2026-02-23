@@ -60,13 +60,13 @@ class PortagePipFS(Operations):
     - Thin overlay layout with on-demand content generation
     """
     
-    def __init__(self, root: str = "/", cache_ttl: int = 300):
+    def __init__(self, root: str = "/", cache_ttl: int = 3600, cache_dir: Optional[str] = None):
         """
         Initialize the FUSE filesystem.
         
         Args:
             root: Root directory for the filesystem operations
-            cache_ttl: Cache time-to-live in seconds (default: 5 minutes)
+            cache_ttl: Cache time-to-live in seconds (default: 1 hour)
         """
         self.root = root
         self.cache_ttl = cache_ttl
@@ -79,7 +79,7 @@ class PortagePipFS(Operations):
         
         # Name translation components
         self.name_translator = create_prefetched_translator()
-        self.pypi_extractor = PyPIMetadataExtractor()
+        self.pypi_extractor = PyPIMetadataExtractor(cache_ttl=cache_ttl, cache_dir=cache_dir)
         self.ebuild_extractor = EbuildDataExtractor()
         
         # Static overlay structure
@@ -538,7 +538,7 @@ cache-formats = md5-dict
         return '\n'.join(manifest_lines) + ('\n' if manifest_lines else '')
 
 
-def mount_filesystem(mountpoint: str, foreground: bool = False, debug: bool = False, cache_ttl: int = 300):
+def mount_filesystem(mountpoint: str, foreground: bool = False, debug: bool = False, cache_ttl: int = 3600, cache_dir: Optional[str] = None):
     """
     Mount the portage-pip FUSE filesystem.
     
@@ -546,7 +546,8 @@ def mount_filesystem(mountpoint: str, foreground: bool = False, debug: bool = Fa
         mountpoint: Path where the filesystem should be mounted
         foreground: Run in foreground instead of daemonizing
         debug: Enable debug output
-        cache_ttl: Cache time-to-live in seconds (default: 5 minutes)
+        cache_ttl: Cache time-to-live in seconds (default: 1 hour)
+        cache_dir: Cache directory for PyPI metadata (default: system temp)
     """
     if debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -554,5 +555,5 @@ def mount_filesystem(mountpoint: str, foreground: bool = False, debug: bool = Fa
         logging.basicConfig(level=logging.INFO)
         
     logger.info(f"Mounting portage-pip FUSE filesystem at {mountpoint}")
-    fs = PortagePipFS(cache_ttl=cache_ttl)
+    fs = PortagePipFS(cache_ttl=cache_ttl, cache_dir=cache_dir)
     FUSE(fs, mountpoint, nothreads=True, foreground=foreground, debug=debug)
