@@ -236,6 +236,19 @@ cache-formats = md5-dict
             
         raise FuseOSError(errno.EACCES)
         
+    def getxattr(self, path, name, position=0):
+        """Get extended file attributes."""
+        # We don't support extended attributes, but return empty instead of error
+        # This prevents the traceback spam in logs
+        # Use ENODATA if available, otherwise ENOTSUP
+        error_code = getattr(errno, 'ENODATA', errno.ENOTSUP)
+        raise FuseOSError(error_code)
+        
+    def listxattr(self, path):
+        """List extended file attributes."""
+        # Return empty list - we don't have any extended attributes
+        return []
+        
     def getattr(self, path, fh=None):
         """Get file attributes."""
         parsed = self._parse_path(path)
@@ -272,7 +285,21 @@ cache-formats = md5-dict
                 'st_size': len(content),
             })
         elif parsed['type'] in ['ebuild', 'package_metadata', 'manifest']:
-            # Dynamic file - estimate size or get from cache
+            # Dynamic file - check if it should exist
+            if parsed['type'] == 'ebuild':
+                # Verify that this ebuild version actually exists
+                gentoo_name = parsed['package']
+                pypi_name = self._gentoo_to_pypi(gentoo_name)
+                if pypi_name:
+                    try:
+                        versions = self._get_package_versions(pypi_name)
+                        if parsed['version'] not in versions:
+                            raise FuseOSError(errno.ENOENT)
+                    except Exception:
+                        # If we can't verify, allow it but log debug
+                        logger.debug(f"Cannot verify version for {path}")
+                        
+            # File exists, set attributes
             attrs.update({
                 'st_mode': stat.S_IFREG | 0o644,
                 'st_nlink': 1,
@@ -284,6 +311,8 @@ cache-formats = md5-dict
             if cached:
                 attrs['st_size'] = len(cached)
         else:
+            # Unknown path type - this is normal for filesystem exploration
+            logger.debug(f"Path not found: {path} (type: {parsed['type']})")
             raise FuseOSError(errno.ENOENT)
             
         return attrs
@@ -363,8 +392,16 @@ cache-formats = md5-dict
         # Check if it's a valid dynamic file
         parsed = self._parse_path(path)
         if parsed['type'] in ['ebuild', 'package_metadata', 'manifest']:
+            # Additional verification for ebuilds
+            if parsed['type'] == 'ebuild':
+                gentoo_name = parsed['package']
+                pypi_name = self._gentoo_to_pypi(gentoo_name)
+                if not pypi_name:
+                    logger.debug(f"Cannot translate package name: {gentoo_name}")
+                    raise FuseOSError(errno.ENOENT)
             return 0
             
+        logger.debug(f"Cannot open path: {path} (type: {parsed['type']})")
         raise FuseOSError(errno.ENOENT)
         
     def _generate_content(self, path: str) -> Optional[str]:
