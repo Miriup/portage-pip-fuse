@@ -86,7 +86,7 @@ class FilterDependencyTree(FilterBase):
     """
     
     def __init__(self, root_packages: List[str], use_flags: Optional[List[str]] = None,
-                 cache_dir: Optional[Path] = None, max_depth: int = 3):
+                 cache_dir: Optional[Path] = None, max_depth: int = 10):
         """
         Initialize dependency tree filter.
         
