@@ -558,13 +558,14 @@ cache-formats = md5-dict
                 ebuild_lines.append(f"\t{dep}")
             ebuild_lines.append(f"\"")
             
-        # Add optional dependencies with USE flags
+        # Add optional dependencies with USE flags (grouped properly per Gentoo style)
         if data.get('OPTIONAL_DEPEND'):
             ebuild_lines.append(f"")
             ebuild_lines.append(f"RDEPEND+=\"")
             for use_flag, deps in data['OPTIONAL_DEPEND'].items():
-                for dep in deps:
-                    ebuild_lines.append(f"\t{use_flag}? ( {dep} )")
+                if deps:  # Only add if there are dependencies
+                    deps_str = ' '.join(deps)
+                    ebuild_lines.append(f"\t{use_flag}? ( {deps_str} )")
             ebuild_lines.append(f"\"")
             
         return '\n'.join(ebuild_lines) + '\n'
