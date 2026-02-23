@@ -485,11 +485,18 @@ cache-formats = md5-dict
             return None
             
         # Find the PyPI version that corresponds to this Gentoo version
+        # We need to use raw PyPI JSON data since the metadata structure doesn't have all_versions
         pypi_version = None
-        for pypi_ver in metadata.get('all_versions', []):
-            if self._translate_version(pypi_ver) == version:
-                pypi_version = pypi_ver
-                break
+        try:
+            json_data = self.pypi_extractor.get_package_json(pypi_name)
+            if json_data and 'releases' in json_data:
+                for pypi_ver in json_data['releases']:
+                    if self._translate_version(pypi_ver) == version:
+                        pypi_version = pypi_ver
+                        break
+        except Exception as e:
+            logger.debug(f"Error finding PyPI version for {version}: {e}")
+            return None
                 
         if not pypi_version:
             return None
