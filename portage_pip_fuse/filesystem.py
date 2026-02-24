@@ -338,9 +338,7 @@ cache-formats = md5-dict
                 return True
             
             # Check if ANY version is valid for Gentoo
-            from .pip_metadata import EbuildDataExtractor
-            extractor = EbuildDataExtractor()
-            python_compat = extractor.format_python_compat(python_versions)
+            python_compat = self.ebuild_extractor.format_python_compat(python_versions)
             
             # If PYTHON_COMPAT would be empty, don't show this version
             result = len(python_compat) > 0
@@ -415,10 +413,12 @@ cache-formats = md5-dict
                     
                 gentoo_ver = self._translate_version(pypi_ver)
                 if gentoo_ver:
-                    # OPTIMIZATION: Skip expensive Python compat check during listing
-                    # The version filter should have already filtered incompatible versions
-                    # and ebuilds will still show correct PYTHON_COMPAT when read
-                    gentoo_versions.append(gentoo_ver)
+                    # Check if this version would have valid PYTHON_COMPAT
+                    # We cache these results to avoid repeated expensive lookups
+                    if self._would_have_valid_python_compat(pypi_name, pypi_ver):
+                        gentoo_versions.append(gentoo_ver)
+                    else:
+                        logger.debug(f"Skipping {pypi_name}-{pypi_ver}: would have empty PYTHON_COMPAT")
                     
             sorted_versions = sorted(gentoo_versions, reverse=True)  # Newest first
             
@@ -885,7 +885,7 @@ cache-formats = md5-dict
             f"EAPI=8",
             f"",
             f"DISTUTILS_USE_PEP517=standalone",
-            f"PYTHON_COMPAT=( {' '.join(data.get('PYTHON_COMPAT', ['python3_8', 'python3_9', 'python3_10', 'python3_11', 'python3_12']))} )",
+            f"PYTHON_COMPAT=( {' '.join(data.get('PYTHON_COMPAT', ['python3_11', 'python3_12', 'python3_13']))} )",
             f"",
             f"inherit distutils-r1 pypi",
             f"",

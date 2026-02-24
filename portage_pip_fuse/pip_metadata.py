@@ -827,6 +827,9 @@ class EbuildDataExtractor:
         cls._cache_timestamp = current_time
         return fallback
     
+    # Class-level cache for format_python_compat results (shared across instances)
+    _compat_cache = {}
+    
     def format_python_compat(self, python_versions: List[str]) -> str:
         """
         Format Python versions for PYTHON_COMPAT variable.
@@ -849,6 +852,11 @@ class EbuildDataExtractor:
             >>> 'python3_11' in compat  # Should not auto-extend
             False
         """
+        # Check cache first
+        cache_key = tuple(sorted(python_versions)) if python_versions else ()
+        if cache_key in self._compat_cache:
+            return self._compat_cache[cache_key]
+        
         if not python_versions:
             # Get system PYTHON_TARGETS as fallback
             try:
@@ -873,6 +881,12 @@ class EbuildDataExtractor:
         
         # Get valid implementations from eclass
         valid_impls = self._get_valid_python_impls()
+        if not valid_impls:
+            # No valid implementations available
+            result = []
+            self._compat_cache[cache_key] = result
+            return result
+            
         compat_versions = []
         
         # Only include explicitly supported versions that are also in _PYTHON_ALL_IMPLS
@@ -915,7 +929,11 @@ class EbuildDataExtractor:
         # If we have both generic '3' and specific versions, ignore the generic '3'
         
         # Remove duplicates and sort
-        return sorted(list(set(compat_versions)))
+        result = sorted(list(set(compat_versions)))
+        
+        # Cache the result
+        self._compat_cache[cache_key] = result
+        return result
     
     def translate_license(self, pypi_license: str) -> str:
         """
