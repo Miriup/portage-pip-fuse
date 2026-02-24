@@ -540,8 +540,8 @@ class FilterCurated(FilterBase):
     
     @classmethod
     def is_default_filter(cls) -> bool:
-        """This filter is enabled by default."""
-        return True
+        """This filter is NOT enabled by default - must be explicitly requested."""
+        return False
         
     def get_packages(self) -> Set[str]:
         """Return the curated package list."""
@@ -797,30 +797,22 @@ class FilterSourceDistribution(FilterBase):
         # Get popular packages from RSS feed as candidates
         packages_to_check = set()
         
-        try:
-            # Use recent packages as a practical base set
-            response = requests.get('https://pypi.org/rss/updates.xml', timeout=30)
-            response.raise_for_status()
-            
-            root = ET.fromstring(response.content)
-            
-            # Extract package names from RSS items
-            for item in root.findall('.//item'):
-                title = item.find('title')
-                if title is not None and title.text:
-                    # Title format: "package-name version"
-                    package_name = title.text.split()[0] if ' ' in title.text else title.text
-                    packages_to_check.add(package_name)
-            
-            logger.info(f"Checking {len(packages_to_check)} packages for source distributions")
-            
-        except Exception as e:
-            logger.warning(f"Could not fetch package list from RSS: {e}")
-            # Fallback to curated list
-            curated_filter = FilterCurated()
-            packages_to_check = curated_filter.get_packages()
-            logger.info(f"Using curated list fallback: {len(packages_to_check)} packages")
+        # Use recent packages as a practical base set
+        response = requests.get('https://pypi.org/rss/updates.xml', timeout=30)
+        response.raise_for_status()
         
+        root = ET.fromstring(response.content)
+        
+        # Extract package names from RSS items
+        for item in root.findall('.//item'):
+            title = item.find('title')
+            if title is not None and title.text:
+                # Title format: "package-name version"
+                package_name = title.text.split()[0] if ' ' in title.text else title.text
+                packages_to_check.add(package_name)
+        
+        logger.info(f"Checking {len(packages_to_check)} packages for source distributions")
+            
         # Check each package for source distribution availability
         packages_with_source = set()
         

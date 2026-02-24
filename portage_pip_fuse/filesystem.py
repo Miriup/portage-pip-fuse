@@ -124,7 +124,7 @@ class PortagePipFS(Operations):
         
     def _create_filter(self, filter_config: Dict) -> FilterBase:
         """Create package filter based on configuration."""
-        active_filters = filter_config.get('active_filters', ['curated'])
+        active_filters = filter_config.get('active_filters', [])
         
         if not active_filters:
             # No filters - return all packages
