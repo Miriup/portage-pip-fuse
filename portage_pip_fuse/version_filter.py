@@ -18,6 +18,7 @@ Licensed under GPL-2.0
 import logging
 import os
 import subprocess
+import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Set, Optional, Any
 from pathlib import Path
@@ -131,6 +132,11 @@ class VersionFilterPythonCompat(VersionFilterBase):
     versions that are compatible with at least one system Python.
     """
     
+    # Class-level cache for _PYTHON_ALL_IMPLS (shared across all instances)
+    _cached_python_impls = None
+    _cache_timestamp = 0
+    _cache_ttl = 3600  # Cache for 1 hour
+    
     def __init__(self):
         """Initialize with system Python targets."""
         self.valid_impls = self._get_python_all_impls()
@@ -185,15 +191,25 @@ class VersionFilterPythonCompat(VersionFilterBase):
         
         return versions
     
-    def _get_python_all_impls(self) -> Set[str]:
+    @classmethod
+    def _get_python_all_impls(cls) -> Set[str]:
         """
         Get _PYTHON_ALL_IMPLS from python-utils-r1.eclass using Portage APIs.
         
-        This is the list of Python implementations currently supported by Gentoo.
+        This is a class method with caching to avoid repeatedly reading the eclass.
+        The cache is shared across all instances and refreshed every hour.
         """
+        import time
+        current_time = time.time()
+        
+        # Check if cache is still valid
+        if (cls._cached_python_impls is not None and 
+            current_time - cls._cache_timestamp < cls._cache_ttl):
+            return cls._cached_python_impls
+        
+        # Cache miss or expired - read from eclass
         try:
             import portage
-            import subprocess
             
             # Get the Gentoo repo location using Portage API
             settings = portage.config()
@@ -210,9 +226,12 @@ class VersionFilterPythonCompat(VersionFilterBase):
                                   capture_output=True, text=True, timeout=5)
             
             if result.returncode == 0 and result.stdout:
-                impls = result.stdout.strip().split()
-                logger.debug(f"Got _PYTHON_ALL_IMPLS from eclass: {impls}")
-                return set(impls)
+                impls = set(result.stdout.strip().split())
+                # Update cache
+                cls._cached_python_impls = impls
+                cls._cache_timestamp = current_time
+                logger.debug(f"Refreshed _PYTHON_ALL_IMPLS cache: {sorted(impls)}")
+                return impls
             else:
                 logger.warning(f"Failed to read eclass: {result.stderr}")
             
@@ -224,11 +243,15 @@ class VersionFilterPythonCompat(VersionFilterBase):
             logger.warning(f"Could not read _PYTHON_ALL_IMPLS from eclass: {e}")
         
         # Fallback to hardcoded current values (as of 2024/2025)
-        return {
+        fallback = {
             'pypy3_11',
             'python3_11', 'python3_12', 'python3_13', 'python3_14',
             'python3_13t', 'python3_14t'
         }
+        # Cache the fallback too
+        cls._cached_python_impls = fallback
+        cls._cache_timestamp = current_time
+        return fallback
     
     def filter_versions(self, pypi_name: str, versions_metadata: Dict[str, Dict]) -> Dict[str, Dict]:
         """Filter to only Python-compatible versions."""
