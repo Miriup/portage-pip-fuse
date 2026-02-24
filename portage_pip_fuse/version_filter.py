@@ -263,100 +263,77 @@ class VersionFilterPythonCompat(VersionFilterBase):
     
     def should_include_version(self, pypi_name: str, version: str, metadata: Dict) -> bool:
         """Check if version is compatible with valid Gentoo Python implementations."""
-        # Get requires_python from metadata
+        # Get requires_python from metadata - this is the authoritative source
         info = metadata.get('info', metadata)
         requires_python = info.get('requires_python', '')
-        
-        # Check version-specific Python versions if provided
-        # This is more accurate than classifiers from the latest version
-        python_versions = metadata.get('python_versions', [])
-        
-        if python_versions:
-            # Check if ANY declared version is in valid implementations
-            has_valid_impl = False
-            for ver in python_versions:
-                impl_name = f"python{ver.replace('.', '_')}"
-                if impl_name in self.valid_impls:
-                    has_valid_impl = True
-                    break
-            
-            if not has_valid_impl:
-                logger.debug(f"Version {version} of {pypi_name} declares Python {python_versions}, "
-                           f"none are valid Gentoo implementations - filtering out")
-                return False
-        else:
-            # Fallback to classifiers if no version-specific data
-            classifiers = info.get('classifiers', [])
-            declared_versions = self._extract_python_versions_from_classifiers(classifiers)
-            
-            if declared_versions:
-                # Check if ANY declared version is in valid implementations
-                has_valid_impl = False
-                for ver in declared_versions:
-                    impl_name = f"python{ver.replace('.', '_')}"
-                    if impl_name in self.valid_impls:
-                        has_valid_impl = True
-                        break
-                
-                if not has_valid_impl:
-                    logger.debug(f"Version {version} of {pypi_name} declares Python {declared_versions}, "
-                               f"none are valid Gentoo implementations")
-                    return False
-        
-        if not requires_python:
-            # No requirement - check if we have ANY valid Python implementation
-            # But if declared_versions were all invalid, we already returned False above
-            return len(self.supported_pythons) > 0
-        
-        # Check if any valid Python implementation satisfies the requirement
-        try:
-            from packaging.specifiers import SpecifierSet
-            spec = SpecifierSet(requires_python)
-            
-            # We need to check against implementations that are BOTH:
-            # 1. In _PYTHON_ALL_IMPLS (valid for Gentoo)
-            # 2. Satisfy the package's requires_python
-            
-            compatible_impls = []
-            for impl in self.valid_impls:
-                # Convert impl name to version (python3_11 -> 3.11)
-                if impl.startswith('python3_'):
-                    # Handle both python3_11 and python3_13t
-                    suffix = impl[8:]  # Remove 'python3_'
-                    if suffix.endswith('t'):  # Free-threading build
-                        version_part = suffix[:-1]  # Remove 't' suffix
-                    else:
-                        version_part = suffix
-                    
-                    try:
-                        py_version = f"3.{version_part}"
-                        if py_version in spec:
-                            compatible_impls.append(impl)
-                    except ValueError:
-                        # Skip malformed versions
-                        continue
-                elif impl.startswith('pypy3_'):
-                    # PyPy3_11 corresponds roughly to Python 3.10
-                    # This is a simplification - we could look this up
-                    if impl == 'pypy3_11':
+
+        # If requires_python is available, use it as the primary check
+        # This is more reliable than classifiers which are often incomplete
+        # (e.g., package says >=3.10 but only lists "Python :: 3.10" in classifiers)
+        if requires_python:
+            try:
+                from packaging.specifiers import SpecifierSet
+                spec = SpecifierSet(requires_python)
+
+                # Check which valid Gentoo Python implementations satisfy the requirement
+                compatible_impls = []
+                for impl in self.valid_impls:
+                    # Convert impl name to version (python3_11 -> 3.11)
+                    if impl.startswith('python3_'):
+                        # Handle both python3_11 and python3_13t
+                        suffix = impl[8:]  # Remove 'python3_'
+                        if suffix.endswith('t'):  # Free-threading build
+                            version_part = suffix[:-1]  # Remove 't' suffix
+                        else:
+                            version_part = suffix
+
                         try:
-                            if '3.10' in spec:
+                            py_version = f"3.{version_part}"
+                            if py_version in spec:
                                 compatible_impls.append(impl)
                         except ValueError:
+                            # Skip malformed versions
                             continue
-            
-            if compatible_impls:
-                logger.debug(f"Version {version} of {pypi_name} compatible with: {compatible_impls}")
-                return True
-            else:
-                logger.debug(f"Version {version} of {pypi_name} requires Python {requires_python}, "
-                           f"no valid Gentoo Python implementations available")
-                return False
-            
-        except Exception as e:
-            logger.warning(f"Could not parse Python requirement '{requires_python}': {e}")
-            # Be permissive on parse errors - let it through if we have valid Pythons
-            return len(self.supported_pythons) > 0
+                    elif impl.startswith('pypy3_'):
+                        # PyPy3_11 corresponds roughly to Python 3.10
+                        if impl == 'pypy3_11':
+                            try:
+                                if '3.10' in spec:
+                                    compatible_impls.append(impl)
+                            except ValueError:
+                                continue
+
+                if compatible_impls:
+                    logger.debug(f"Version {version} of {pypi_name} compatible with: {compatible_impls}")
+                    return True
+                else:
+                    logger.debug(f"Version {version} of {pypi_name} requires Python {requires_python}, "
+                               f"no valid Gentoo Python implementations available")
+                    return False
+
+            except Exception as e:
+                logger.warning(f"Could not parse Python requirement '{requires_python}': {e}")
+                # Be permissive on parse errors - let it through if we have valid Pythons
+                return len(self.supported_pythons) > 0
+
+        # No requires_python - fall back to classifiers
+        classifiers = info.get('classifiers', [])
+        declared_versions = self._extract_python_versions_from_classifiers(classifiers)
+
+        if declared_versions:
+            # Check if ANY declared version is in valid implementations
+            for ver in declared_versions:
+                impl_name = f"python{ver.replace('.', '_')}"
+                if impl_name in self.valid_impls:
+                    logger.debug(f"Version {version} of {pypi_name} compatible via classifier: {impl_name}")
+                    return True
+
+            logger.debug(f"Version {version} of {pypi_name} declares Python {declared_versions}, "
+                       f"none are valid Gentoo implementations")
+            return False
+
+        # No Python version info at all - be permissive
+        return len(self.supported_pythons) > 0
     
     def _extract_python_versions_from_classifiers(self, classifiers: List[str]) -> List[str]:
         """

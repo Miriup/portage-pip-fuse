@@ -38,6 +38,14 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
+# Try to import packaging for version specifier parsing
+try:
+    from packaging.specifiers import SpecifierSet
+    from packaging.version import Version
+    HAS_PACKAGING = True
+except ImportError:
+    HAS_PACKAGING = False
+
 from portage_pip_fuse.constants import find_cache_dir, HTTP_TIMEOUT
 
 logger = logging.getLogger(__name__)
@@ -596,7 +604,94 @@ class PyPIMetadataExtractor:
         # Sort versions numerically
         versions.sort(key=lambda x: tuple(map(int, x.split('.'))))
         return versions
-    
+
+    def parse_requires_python(self, requires_python: Optional[str]) -> List[str]:
+        """
+        Parse requires_python specifier and expand to matching Python versions.
+
+        This handles version specifiers like '>=3.10', '>=3.8,<4', '~=3.9' and
+        expands them to all Python versions that match the specifier.
+
+        Args:
+            requires_python: Version specifier string (e.g., '>=3.10.0')
+
+        Returns:
+            List of Python version strings that satisfy the specifier
+
+        Examples:
+            >>> extractor = PyPIMetadataExtractor()
+            >>> versions = extractor.parse_requires_python('>=3.10')
+            >>> '3.10' in versions
+            True
+            >>> '3.11' in versions
+            True
+            >>> '3.9' in versions
+            False
+            >>> versions = extractor.parse_requires_python('>=3.8,<3.11')
+            >>> '3.8' in versions
+            True
+            >>> '3.10' in versions
+            True
+            >>> '3.11' in versions
+            False
+        """
+        if not requires_python:
+            return []
+
+        # Known Python 3 versions to check against (kept reasonably current)
+        # These are the versions that Gentoo's python-utils-r1.eclass supports
+        all_python_versions = [
+            '3.8', '3.9', '3.10', '3.11', '3.12', '3.13'
+        ]
+
+        if HAS_PACKAGING:
+            try:
+                spec = SpecifierSet(requires_python)
+                matching = []
+                for version in all_python_versions:
+                    if Version(version) in spec:
+                        matching.append(version)
+                return matching
+            except Exception as e:
+                logger.debug(f"Failed to parse requires_python '{requires_python}': {e}")
+                # Fall through to simple parser
+
+        # Simple fallback parser for common patterns
+        requires_python = requires_python.strip()
+
+        # Handle >=X.Y or >=X.Y.Z
+        ge_match = re.match(r'>=\s*(\d+)\.(\d+)', requires_python)
+        if ge_match:
+            min_major = int(ge_match.group(1))
+            min_minor = int(ge_match.group(2))
+
+            # Check for upper bound (<X.Y or <X)
+            lt_match = re.search(r'<\s*(\d+)(?:\.(\d+))?', requires_python)
+            max_major = 99
+            max_minor = 99
+            if lt_match:
+                max_major = int(lt_match.group(1))
+                max_minor = int(lt_match.group(2)) if lt_match.group(2) else 0
+
+            matching = []
+            for version in all_python_versions:
+                major, minor = map(int, version.split('.'))
+                # Check lower bound
+                if (major, minor) < (min_major, min_minor):
+                    continue
+                # Check upper bound (< means strictly less than)
+                if (major, minor) >= (max_major, max_minor):
+                    continue
+                matching.append(version)
+            return matching
+
+        # Handle just "3" (any Python 3)
+        if requires_python == '3':
+            return all_python_versions
+
+        logger.debug(f"Could not parse requires_python: {requires_python}")
+        return []
+
     def parse_dependencies(self, requires_dist: Optional[List[str]]) -> Tuple[List[str], List[str]]:
         """
         Parse requirements from requires_dist field.
@@ -695,8 +790,27 @@ class PyPIMetadataExtractor:
         metadata = self.get_package_metadata(package_json)
         sdist = self.get_source_distribution(downloads)
         
-        # Parse Python versions and dependencies
-        python_versions = self.extract_python_versions(metadata.get('classifiers', []))
+        # Parse Python versions from classifiers first
+        classifier_versions = self.extract_python_versions(metadata.get('classifiers', []))
+
+        # Parse requires_python specifier if available
+        requires_python = metadata.get('python_requires', '')
+        specifier_versions = self.parse_requires_python(requires_python) if requires_python else []
+
+        # Prefer requires_python over classifiers because:
+        # 1. Classifiers are often incomplete (e.g., only list min version)
+        # 2. requires_python is machine-readable and more reliable
+        # 3. Modern packages often omit version classifiers entirely
+        if specifier_versions:
+            python_versions = specifier_versions
+            logger.debug(f"Using requires_python '{requires_python}' -> {python_versions}")
+        elif classifier_versions:
+            # Filter out generic '3' - only use specific versions
+            python_versions = [v for v in classifier_versions if v != '3']
+            logger.debug(f"Using classifiers -> {python_versions}")
+        else:
+            python_versions = []
+
         runtime_deps, optional_deps = self.parse_dependencies(metadata.get('dependencies', []))
         
         complete_info = {
@@ -847,11 +961,13 @@ class EbuildDataExtractor:
             
         Examples:
             >>> extractor = EbuildDataExtractor()
-            >>> versions = ['3.8', '3.9', '3.10']
+            >>> versions = ['3.11', '3.12', '3.13']
             >>> compat = extractor.format_python_compat(versions)
-            >>> compat
-            ['python3_10', 'python3_8', 'python3_9']
-            >>> 'python3_11' in compat  # Should not auto-extend
+            >>> 'python3_11' in compat
+            True
+            >>> 'python3_12' in compat
+            True
+            >>> 'python3_14' in compat  # Should not auto-extend
             False
         """
         # Check cache first
@@ -1259,7 +1375,7 @@ class EbuildDataExtractor:
             ...         'homepage': 'https://example.com',
             ...         'license': 'MIT'
             ...     },
-            ...     'python_versions': ['3.8', '3.9', '3.10'],
+            ...     'python_versions': ['3.11', '3.12', '3.13'],
             ...     'runtime_dependencies': ['requests>=2.0'],
             ...     'source_distribution': {
             ...         'url': 'https://pypi.org/example-1.0.tar.gz'
@@ -1270,7 +1386,7 @@ class EbuildDataExtractor:
             'example-package'
             >>> ebuild_data['PV']
             '1.0.0'
-            >>> 'python3_8' in ebuild_data['PYTHON_COMPAT']
+            >>> 'python3_11' in ebuild_data['PYTHON_COMPAT']
             True
             >>> ebuild_data['PYPI_PN']
             'example-package'

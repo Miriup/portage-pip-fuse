@@ -1051,15 +1051,21 @@ cache-formats = md5-dict
         pypi_name = self._gentoo_to_pypi(package)
         if not pypi_name:
             return None
-            
-        metadata = self._get_package_metadata(pypi_name)
-        if not metadata:
+
+        # Get the versions from raw PyPI JSON (get_complete_package_info doesn't have all_versions)
+        try:
+            json_data = self.pypi_extractor.get_package_json(pypi_name)
+            if not json_data or 'releases' not in json_data:
+                return None
+            all_versions = list(json_data['releases'].keys())
+        except Exception as e:
+            logger.error(f"Failed to get versions for {pypi_name}: {e}")
             return None
-            
+
         manifest_lines = []
 
-        # Get all versions and generate DIST entries
-        for pypi_version in metadata.get('all_versions', []):
+        # Generate DIST entries for each version
+        for pypi_version in all_versions:
             # Check for interrupts between version iterations
             check_interrupt()
 
