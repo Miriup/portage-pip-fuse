@@ -17,7 +17,7 @@ import re
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
 from urllib.parse import urlparse
 
 # Try to import pip's internal APIs
@@ -766,6 +766,39 @@ class EbuildDataExtractor:
             'Unlicense': 'Unlicense',
         }
     
+    def _get_valid_python_impls(self) -> Set[str]:
+        """Get valid Python implementations from _PYTHON_ALL_IMPLS."""
+        try:
+            import portage
+            import subprocess
+            
+            # Get the Gentoo repo location using Portage API
+            settings = portage.config()
+            repo_path = settings.repositories.get_location_for_name("gentoo")
+            if not repo_path:
+                raise ValueError("Could not find Gentoo repository")
+            
+            eclass_path = os.path.join(repo_path, "eclass", "python-utils-r1.eclass")
+            
+            # Source the eclass and get _PYTHON_ALL_IMPLS
+            cmd = f'EAPI=8 source {eclass_path} && echo "${{_PYTHON_ALL_IMPLS[@]}}"'
+            result = subprocess.run(['bash', '-c', cmd], 
+                                  capture_output=True, text=True, timeout=5)
+            
+            if result.returncode == 0 and result.stdout:
+                impls = result.stdout.strip().split()
+                return set(impls)
+                
+        except Exception as e:
+            logger.warning(f"Could not read _PYTHON_ALL_IMPLS: {e}")
+        
+        # Fallback to hardcoded current values
+        return {
+            'pypy3_11',
+            'python3_11', 'python3_12', 'python3_13', 'python3_14',
+            'python3_13t', 'python3_14t'
+        }
+    
     def format_python_compat(self, python_versions: List[str]) -> str:
         """
         Format Python versions for PYTHON_COMPAT variable.
@@ -810,9 +843,11 @@ class EbuildDataExtractor:
                 # Ultimate fallback if portageq fails
                 python_versions = ['3.10', '3.11', '3.12']
         
+        # Get valid implementations from eclass
+        valid_impls = self._get_valid_python_impls()
         compat_versions = []
         
-        # Only include explicitly supported versions
+        # Only include explicitly supported versions that are also in _PYTHON_ALL_IMPLS
         has_generic = False
         specific_versions = []
         
@@ -822,28 +857,33 @@ class EbuildDataExtractor:
             elif '.' in version:
                 major, minor = version.split('.', 1)
                 if major == '3' and minor.isdigit():
-                    minor_int = int(minor)
-                    if minor_int >= 8:  # Only include 3.8+
-                        version_str = f'python{major}_{minor}'
+                    version_str = f'python{major}_{minor}'
+                    # Only include if it's in _PYTHON_ALL_IMPLS
+                    if version_str in valid_impls:
                         if version_str not in compat_versions:
                             compat_versions.append(version_str)
-                            specific_versions.append(minor_int)
+                            specific_versions.append(int(minor))
+                    else:
+                        logger.debug(f"Skipping {version_str} - not in _PYTHON_ALL_IMPLS")
         
         # If we have generic '3' AND specific versions, only use the specific versions
-        # If we have ONLY generic '3', use system targets
+        # If we have ONLY generic '3', use system targets that are valid
         if has_generic and not specific_versions:
-            # Only generic "3" - use system targets
+            # Only generic "3" - use system targets that are in _PYTHON_ALL_IMPLS
             try:
                 import subprocess
                 result = subprocess.run(['portageq', 'envvar', 'PYTHON_TARGETS'], 
                                       capture_output=True, text=True, check=True)
                 system_targets = result.stdout.strip().split()
                 for target in system_targets:
-                    if target.startswith('python3_') and target not in compat_versions:
+                    if (target.startswith('python3_') and 
+                        target in valid_impls and 
+                        target not in compat_versions):
                         compat_versions.append(target)
             except Exception:
-                # Fallback for generic "3"
-                compat_versions.extend(['python3_10', 'python3_11', 'python3_12'])
+                # Fallback for generic "3" - use only valid current implementations
+                fallback_impls = [impl for impl in valid_impls if impl.startswith('python3_')]
+                compat_versions.extend(fallback_impls)
         # If we have both generic '3' and specific versions, ignore the generic '3'
         
         # Remove duplicates and sort
