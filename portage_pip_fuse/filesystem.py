@@ -928,7 +928,46 @@ cache-formats = md5-dict
             logger.error(f"Error generating content for {path}: {e}")
             
         return None
-        
+
+    def _escape_double_quotes(self, value: str) -> str:
+        """
+        Escape a string for use in double-quoted shell/bash context.
+
+        In double-quoted strings, these characters have special meaning and
+        must be escaped with a backslash:
+        - \\ (backslash) - escape character itself
+        - $ - variable expansion
+        - ` - command substitution
+        - " - ends the string
+        - ! - history expansion (bash interactive, but escape for safety)
+
+        Uses standard shell escaping with backslashes, which is the same
+        approach used by shlex but for double-quote context.
+
+        Args:
+            value: The string to escape
+
+        Returns:
+            Escaped string safe for double-quoted shell context
+
+        Examples:
+            >>> fs._escape_double_quotes('simple text')
+            'simple text'
+            >>> fs._escape_double_quotes('has `backticks`')
+            'has \\\\`backticks\\\\`'
+            >>> fs._escape_double_quotes('costs $5')
+            'costs \\\\$5'
+        """
+        if not value:
+            return value
+        # Order matters: escape backslashes first, then other special chars
+        value = value.replace('\\', '\\\\')
+        value = value.replace('$', '\\$')
+        value = value.replace('`', '\\`')
+        value = value.replace('"', '\\"')
+        value = value.replace('!', '\\!')
+        return value
+
     def _generate_ebuild(self, category: str, package: str, version: str) -> Optional[str]:
         """Generate ebuild content."""
         # Convert Gentoo package name to PyPI name
@@ -993,7 +1032,7 @@ cache-formats = md5-dict
             f"PYPI_PN=\"{data.get('PYPI_PN', data.get('PN', ''))}\"",
             f"PYPI_PV=\"{data.get('PYPI_PV', data.get('PV', ''))}\"",
             f"",
-            f"DESCRIPTION=\"{data.get('DESCRIPTION', 'Python package from PyPI')}\"",
+            f"DESCRIPTION=\"{self._escape_double_quotes(data.get('DESCRIPTION', 'Python package from PyPI'))}\"",
             f"HOMEPAGE=\"{data.get('HOMEPAGE', 'https://pypi.org/project/' + data.get('PN', ''))}\"",
             f"",
             f"LICENSE=\"{data.get('LICENSE', 'unknown')}\"",
