@@ -77,7 +77,7 @@ portage-pip-fuse unmount --pid-file /path/to/pidfile
 portage-pip-fuse install [mountpoint] [--priority N]
 
 # Sync PyPI metadata database
-portage-pip-fuse sync [--cache-dir DIR]
+portage-pip-fuse sync [--cache-dir DIR] [options]
 
 # Delete the metadata database
 portage-pip-fuse unsync [--force]
@@ -85,6 +85,59 @@ portage-pip-fuse unsync [--force]
 # Translate pip install to emerge (see below)
 portage-pip-fuse pip install [packages...] [-r requirements.txt]
 ```
+
+### Sync Command Options
+
+The `sync` command downloads and manages the PyPI metadata database (~1GB compressed, ~10GB uncompressed):
+
+```bash
+# Standard sync (download and decompress)
+portage-pip-fuse sync
+
+# Only download the compressed database (no decompression)
+portage-pip-fuse sync --only-download
+
+# Only decompress existing .gz file (keeps .gz after decompression)
+portage-pip-fuse sync --only-decompress
+
+# Delete the compressed .gz file
+portage-pip-fuse sync --delete-gz
+
+# Delete the uncompressed SQLite database
+portage-pip-fuse sync --delete-sqlite
+```
+
+#### Custom Workflow for Memory-Constrained Systems
+
+For systems that cannot store the full 10GB SQLite database on disk, you can use an overlayfs with tmpfs:
+
+```bash
+# 1. Download the compressed database (~1GB)
+portage-pip-fuse sync --only-download
+
+# 2. Mount overlayfs with tmpfs on top (example)
+mkdir -p /tmp/overlay/{upper,work}
+sudo mount -t overlay overlay \
+  -o lowerdir=~/.cache/portage-pip-fuse,upperdir=/tmp/overlay/upper,workdir=/tmp/overlay/work \
+  ~/.cache/portage-pip-fuse
+
+# 3. Decompress to the tmpfs overlay
+portage-pip-fuse sync --only-decompress
+
+# 4. Use the FUSE filesystem normally
+portage-pip-fuse mount
+emerge -av dev-python/requests
+
+# 5. Clean up when done
+portage-pip-fuse unmount
+portage-pip-fuse sync --delete-sqlite
+
+# 6. Sync overlayfs changes back to disk if needed
+# (Any metadata cache files will be preserved)
+sudo umount ~/.cache/portage-pip-fuse
+```
+
+This workflow allows you to use the large database on systems with limited disk space but sufficient RAM (16GB+ recommended).
 
 ### pip Command
 

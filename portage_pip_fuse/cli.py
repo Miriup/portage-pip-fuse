@@ -664,7 +664,19 @@ def sync_command():
     """Handle sync subcommand."""
     sync_parser = argparse.ArgumentParser(
         prog='portage-pip-fuse sync',
-        description='Sync PyPI metadata database with latest data'
+        description='Sync PyPI metadata database with latest data',
+        epilog='''
+Custom flow for overlayfs/tmpfs:
+  1. %(prog)s --only-download          # Download compressed database
+  2. Mount overlayfs with tmpfs on top
+  3. %(prog)s --only-decompress         # Decompress to tmpfs overlay
+  4. Use the database normally
+  5. %(prog)s --delete-sqlite           # Remove uncompressed database
+  6. Sync overlayfs cache to disk
+
+This workflow allows using the large SQLite database on memory-constrained systems.
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
     sync_parser.add_argument(
@@ -679,25 +691,104 @@ def sync_command():
         help='Enable debug output'
     )
     
+    sync_parser.add_argument(
+        '--only-download',
+        action='store_true',
+        help='Only download the compressed database and verify SHA256, do not decompress'
+    )
+    
+    sync_parser.add_argument(
+        '--only-decompress',
+        action='store_true',
+        help='Only decompress existing .gz file, do not delete it'
+    )
+    
+    sync_parser.add_argument(
+        '--delete-gz',
+        action='store_true',
+        help='Delete the compressed .gz file'
+    )
+    
+    sync_parser.add_argument(
+        '--delete-sqlite',
+        action='store_true',
+        help='Delete the uncompressed SQLite database (same as unsync command)'
+    )
+    
     # Remove 'sync' from argv and parse remaining args
     sync_argv = [arg for arg in sys.argv[1:] if arg != 'sync']
     args = sync_parser.parse_args(sync_argv)
+    
+    # Check for conflicting options
+    exclusive_count = sum([args.only_download, args.only_decompress, args.delete_gz, args.delete_sqlite])
+    if exclusive_count > 1:
+        print("Error: --only-download, --only-decompress, --delete-gz, and --delete-sqlite are mutually exclusive")
+        return 1
     
     # Set up logging
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(level=log_level, format='%(levelname)s: %(message)s')
     
-    # Create SQLite backend and sync
+    # Determine cache directory
+    cache_dir = find_cache_dir(args.cache_dir)
+    
+    # Handle delete operations first
+    if args.delete_gz:
+        gz_path = cache_dir / 'pypi-data.sqlite.gz'
+        if not gz_path.exists():
+            print("No compressed database file found")
+            return 0
+        try:
+            size = gz_path.stat().st_size
+            gz_path.unlink()
+            print(f"✓ Deleted {gz_path} ({size / (1024*1024):.1f} MB)")
+            return 0
+        except Exception as e:
+            print(f"✗ Failed to delete {gz_path}: {e}")
+            return 1
+    
+    if args.delete_sqlite:
+        # Same as unsync command
+        db_path = cache_dir / 'pypi-data.sqlite'
+        if not db_path.exists():
+            print("No SQLite database found")
+            return 0
+        try:
+            size = db_path.stat().st_size
+            db_path.unlink()
+            print(f"✓ Deleted {db_path} ({size / (1024*1024*1024):.1f} GB)")
+            return 0
+        except Exception as e:
+            print(f"✗ Failed to delete {db_path}: {e}")
+            return 1
+    
+    # Create SQLite backend and perform requested sync operation
     try:
-        cache_dir = find_cache_dir(args.cache_dir)
         backend = SQLiteMetadataBackend(cache_dir=cache_dir)
         
-        success = backend.sync_database()
+        if args.only_download:
+            success = backend.sync_database(only_download=True)
+        elif args.only_decompress:
+            success = backend.sync_database(only_decompress=True)
+        else:
+            # Standard flow
+            success = backend.sync_database()
+        
         if success:
-            print("✓ Database sync completed successfully")
+            if args.only_download:
+                print("✓ Database download completed successfully")
+            elif args.only_decompress:
+                print("✓ Database decompression completed successfully")
+            else:
+                print("✓ Database sync completed successfully")
             return 0
         else:
-            print("✗ Database sync failed")
+            if args.only_download:
+                print("✗ Database download failed")
+            elif args.only_decompress:
+                print("✗ Database decompression failed")
+            else:
+                print("✗ Database sync failed")
             return 1
             
     except Exception as e:

@@ -179,31 +179,42 @@ class SQLiteMetadataBackend:
             logger.warning(f"Failed to fetch release metadata from GitHub API: {e}")
             return None
 
-    def _fetch_gzip_isize(self, url: str, compressed_size: int) -> Optional[int]:
+    def _fetch_gzip_isize(self, source: str, compressed_size: int, from_file: bool = False) -> Optional[int]:
         """
-        Fetch the ISIZE field from the last 4 bytes of a remote gzip file.
+        Fetch the ISIZE field from the last 4 bytes of a gzip file.
 
         The ISIZE is the uncompressed size modulo 2^32.
 
         Args:
-            url: URL of the gzip file
-            compressed_size: Total size of compressed file (for Range header)
+            source: URL of the gzip file or path to local file
+            compressed_size: Total size of compressed file
+            from_file: If True, read from local file instead of URL
 
         Returns:
             ISIZE value (mod 2^32), or None on error
         """
         try:
-            req = urllib.request.Request(url)
-            req.add_header('Range', f'bytes={compressed_size - 4}-{compressed_size - 1}')
-            req.add_header('User-Agent', 'portage-pip-fuse')
-
-            with urllib.request.urlopen(req, timeout=30) as response:
-                if response.status == 206:  # Partial Content
-                    data = response.read(4)
+            if from_file:
+                # Read from local file
+                with open(source, 'rb') as f:
+                    f.seek(compressed_size - 4)
+                    data = f.read(4)
                     if len(data) == 4:
                         return struct.unpack('<I', data)[0]
+                return None
+            else:
+                # Read from URL
+                req = urllib.request.Request(source)
+                req.add_header('Range', f'bytes={compressed_size - 4}-{compressed_size - 1}')
+                req.add_header('User-Agent', 'portage-pip-fuse')
 
-            return None
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    if response.status == 206:  # Partial Content
+                        data = response.read(4)
+                        if len(data) == 4:
+                            return struct.unpack('<I', data)[0]
+
+                return None
 
         except Exception as e:
             logger.warning(f"Failed to fetch gzip ISIZE: {e}")
@@ -280,6 +291,47 @@ class SQLiteMetadataBackend:
             logger.error(f"Failed to verify SHA256: {e}")
             return False
 
+    def _download_only(self, force: bool = False) -> bool:
+        """
+        Download only the compressed database file and verify SHA256.
+        
+        Args:
+            force: Force download even if .gz exists
+            
+        Returns:
+            True if download successful, False otherwise
+        """
+        final_gz_path = Path(str(self.db_path) + '.gz')
+        
+        if not force and final_gz_path.exists():
+            logger.info(f"Compressed database already exists at {final_gz_path}")
+            return True
+        
+        # Download and verify, but don't decompress
+        return self._perform_download(final_gz_path)
+    
+    def _decompress_only(self, gz_path: Path, keep_gz: bool = True) -> bool:
+        """
+        Decompress an existing .gz database file.
+        
+        Args:
+            gz_path: Path to the .gz file
+            keep_gz: If True, keep the .gz file after decompression
+            
+        Returns:
+            True if decompression successful, False otherwise
+        """
+        if not gz_path.exists():
+            logger.error(f"Compressed file not found: {gz_path}")
+            return False
+            
+        # Get uncompressed size estimate
+        compressed_size = gz_path.stat().st_size
+        isize = self._fetch_gzip_isize(str(gz_path), compressed_size, from_file=True)
+        uncompressed_size = self._estimate_uncompressed_size(compressed_size, isize)
+        
+        return self._perform_decompression(gz_path, uncompressed_size, keep_gz=keep_gz)
+    
     def _download_database(self, force: bool = False) -> bool:
         """
         Download SQLite database from pypi-data with resume support.
@@ -298,7 +350,31 @@ class SQLiteMetadataBackend:
         if not force and not self._is_database_stale():
             logger.info("Database is fresh, skipping download")
             return True
-
+        
+        final_gz_path = Path(str(self.db_path) + '.gz')
+        
+        # Download the compressed file
+        if not self._perform_download(final_gz_path):
+            return False
+        
+        # Get uncompressed size estimate
+        compressed_size = final_gz_path.stat().st_size
+        isize = self._fetch_gzip_isize(str(final_gz_path), compressed_size, from_file=True)
+        uncompressed_size = self._estimate_uncompressed_size(compressed_size, isize)
+        
+        # Decompress and delete .gz
+        return self._perform_decompression(final_gz_path, uncompressed_size, keep_gz=False)
+    
+    def _perform_download(self, final_gz_path: Path) -> bool:
+        """
+        Perform the actual download of the compressed database.
+        
+        Args:
+            final_gz_path: Path where the .gz file should be saved
+            
+        Returns:
+            True if download successful, False otherwise
+        """
         logger.info(f"Downloading PyPI metadata database from {self.database_url}")
 
         # Use Gentoo-style download naming
@@ -443,27 +519,49 @@ class SQLiteMetadataBackend:
                     return False
                 print("✅ SHA256 verified")
 
-            # Decompress gzipped SQLite file
-            print("🗜️  Decompressing database...")
+            print(f"✅ Download completed: {final_gz_path}")
+            return True
 
-            # Use .__decompress__ suffix for in-progress decompression (like download)
-            decompress_path = Path(str(self.db_path) + '.__decompress__')
+        except URLError as e:
+            logger.error(f"Failed to download database: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error downloading database: {e}")
+            return False
 
-            # Clean up any previous partial decompression
-            if decompress_path.exists():
-                print("🔄 Removing partial decompression from previous run...")
-                decompress_path.unlink()
+    def _perform_decompression(self, gz_path: Path, uncompressed_size: int, keep_gz: bool = False) -> bool:
+        """
+        Decompress a gzip database file.
+        
+        Args:
+            gz_path: Path to the compressed .gz file
+            uncompressed_size: Estimated uncompressed size for progress
+            keep_gz: If True, keep the .gz file after decompression
+            
+        Returns:
+            True if decompression successful, False otherwise
+        """
+        print("🗜️  Decompressing database...")
 
-            # Get compressed file size for progress
-            compressed_size = final_gz_path.stat().st_size
+        # Use .__decompress__ suffix for in-progress decompression
+        decompress_path = Path(str(self.db_path) + '.__decompress__')
 
-            # Use estimated uncompressed size if available, otherwise fall back to compressed
-            progress_total = uncompressed_size if uncompressed_size > 0 else compressed_size
+        # Clean up any previous partial decompression
+        if decompress_path.exists():
+            print("🔄 Removing partial decompression from previous run...")
+            decompress_path.unlink()
 
+        # Get compressed file size for progress
+        compressed_size = gz_path.stat().st_size
+
+        # Use estimated uncompressed size if available, otherwise fall back to compressed
+        progress_total = uncompressed_size if uncompressed_size > 0 else compressed_size
+
+        try:
             if HAS_TQDM:
                 with tqdm(total=progress_total, unit='B', unit_scale=True, unit_divisor=1024,
                         desc="🗜️  Decompress", ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
-                    with gzip.open(final_gz_path, 'rb') as gz_file:
+                    with gzip.open(gz_path, 'rb') as gz_file:
                         with open(decompress_path, 'wb') as db_file:
                             processed = 0
                             while True:
@@ -479,7 +577,7 @@ class SQLiteMetadataBackend:
                                     db_file.flush()
             else:
                 # Simple decompression without detailed progress
-                with gzip.open(final_gz_path, 'rb') as gz_file:
+                with gzip.open(gz_path, 'rb') as gz_file:
                     with open(decompress_path, 'wb') as db_file:
                         processed = 0
                         start_time = time.time()
@@ -513,12 +611,15 @@ class SQLiteMetadataBackend:
             # Rename decompressed file to final name (atomic operation)
             decompress_path.rename(self.db_path)
 
-            # Clean up compressed file after successful decompression
-            final_gz_path.unlink()
+            # Delete compressed file if requested
+            if not keep_gz:
+                gz_path.unlink()
+                print(f"✅ Database decompressed and compressed file removed")
+            else:
+                print(f"✅ Database decompressed (kept .gz file)")
             
-            # Log final size with success message
+            # Log final size
             final_size = self.db_path.stat().st_size
-            print(f"✅ Database downloaded successfully!")
             print(f"📊 Final size: {self._format_size(final_size)}")
             print(f"📁 Location: {self.db_path}")
             
@@ -527,11 +628,11 @@ class SQLiteMetadataBackend:
 
             return True
 
-        except URLError as e:
-            logger.error(f"Failed to download database: {e}")
-            return False
         except Exception as e:
-            logger.error(f"Error downloading database: {e}")
+            logger.error(f"Error during decompression: {e}")
+            # Clean up partial decompression
+            if decompress_path.exists():
+                decompress_path.unlink()
             return False
 
     def _create_indexes(self, quiet: bool = False) -> bool:
@@ -639,16 +740,52 @@ class SQLiteMetadataBackend:
         # Connect to database
         return self._connect_database()
         
-    def sync_database(self) -> bool:
+    def sync_database(self, only_download: bool = False, only_decompress: bool = False) -> bool:
         """
         Sync database with latest data from pypi-data.
         
         This command should be run periodically to update the local cache
         with the latest PyPI package data.
         
+        Args:
+            only_download: If True, only download the .gz file and verify SHA256
+            only_decompress: If True, only decompress existing .gz file without deleting it
+            
         Returns:
             True if sync successful, False otherwise
         """
+        final_gz_path = Path(str(self.db_path) + '.gz')
+        
+        # Handle only_decompress mode
+        if only_decompress:
+            if not final_gz_path.exists():
+                logger.error(f"Compressed database not found: {final_gz_path}")
+                logger.info("Run 'portage-pip-fuse sync --only-download' first")
+                return False
+                
+            if self.db_path.exists():
+                db_size = self.db_path.stat().st_size
+                logger.info(f"Database already exists at {self.db_path}")
+                logger.info(f"Current size: {self._format_size(db_size)}")
+                # In CLI mode, prompt is handled by cli.py
+                # Here we just proceed with decompression
+            
+            # Only decompress, keep the .gz file
+            return self._decompress_only(final_gz_path, keep_gz=True)
+        
+        # Handle only_download mode
+        if only_download:
+            if final_gz_path.exists():
+                gz_size = final_gz_path.stat().st_size
+                logger.info(f"Compressed database already exists at {final_gz_path}")
+                logger.info(f"Current size: {self._format_size(gz_size)}")
+                # In CLI mode, prompt is handled by cli.py
+                # Here we just proceed with download
+            
+            # Only download and verify, don't decompress
+            return self._download_only(force=True)
+        
+        # Standard flow
         logger.info("Syncing PyPI database with latest data...")
         
         # Show current database status
