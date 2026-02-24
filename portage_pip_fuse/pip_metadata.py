@@ -1048,7 +1048,26 @@ class EbuildDataExtractor:
         
         # Remove duplicates and sort
         result = sorted(list(set(compat_versions)))
-        
+
+        # If no valid versions found, fall back to system PYTHON_TARGETS
+        # PyPI is a Python archive - packages without explicit requirements
+        # should still work with current Python versions
+        if not result:
+            try:
+                import subprocess
+                proc = subprocess.run(['portageq', 'envvar', 'PYTHON_TARGETS'],
+                                     capture_output=True, text=True, check=True)
+                system_targets = proc.stdout.strip().split()
+                for target in system_targets:
+                    if target.startswith('python3_') and target in valid_impls:
+                        result.append(target)
+                result = sorted(result)
+                logger.debug(f"No valid Python versions from metadata, using system targets: {result}")
+            except Exception:
+                # Ultimate fallback - use all valid Python 3 implementations
+                result = sorted([impl for impl in valid_impls if impl.startswith('python3_')])
+                logger.debug(f"Fallback to all valid impls: {result}")
+
         # Cache the result
         self._compat_cache[cache_key] = result
         return result
