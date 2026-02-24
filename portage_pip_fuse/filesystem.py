@@ -312,7 +312,7 @@ cache-formats = md5-dict
         cached = self._get_cached_metadata(pypi_name)
         if cached:
             return cached
-            
+
         try:
             metadata = self.pypi_extractor.get_complete_package_info(pypi_name)
             if metadata:
@@ -321,7 +321,57 @@ cache-formats = md5-dict
         except Exception as e:
             logger.error(f"Failed to fetch metadata for {pypi_name}: {e}")
             return None
-    
+
+    def _package_exists(self, pypi_name: str) -> bool:
+        """
+        Lightweight check if a PyPI package exists.
+
+        This is much faster than _get_package_versions() as it only checks
+        if the package JSON is available, without processing versions.
+        """
+        cache_key = f"exists_{pypi_name}"
+        if cache_key in self._metadata_cache:
+            result, timestamp = self._metadata_cache[cache_key]
+            if time.time() - timestamp < self.cache_ttl:
+                return result
+
+        try:
+            json_data = self.pypi_extractor.get_package_json(pypi_name)
+            exists = json_data is not None and 'releases' in json_data
+            self._metadata_cache[cache_key] = (exists, time.time())
+            return exists
+        except Exception:
+            self._metadata_cache[cache_key] = (False, time.time())
+            return False
+
+    def _version_exists(self, pypi_name: str, gentoo_version: str) -> bool:
+        """
+        Check if a specific version exists for a package.
+
+        Converts Gentoo version back to PyPI format and checks releases.
+        """
+        try:
+            json_data = self.pypi_extractor.get_package_json(pypi_name)
+            if not json_data or 'releases' not in json_data:
+                return False
+
+            # Convert Gentoo version back to PyPI version
+            pypi_ver = gentoo_version.replace('_alpha', 'a').replace('_beta', 'b').replace('_rc', 'rc')
+            pypi_ver = pypi_ver.replace('_p', '.post').replace('.9999.', '.dev')
+
+            # Check if this version exists in releases
+            if pypi_ver in json_data['releases']:
+                return True
+
+            # Also check if any release translates to this Gentoo version
+            for release_ver in json_data['releases']:
+                if self._translate_version(release_ver) == gentoo_version:
+                    return True
+
+            return False
+        except Exception:
+            return False
+
     def _would_have_valid_python_compat(self, pypi_name: str, version: str) -> bool:
         """
         Check if this version would have valid PYTHON_COMPAT entries.
@@ -425,12 +475,9 @@ cache-formats = md5-dict
 
                 gentoo_ver = self._translate_version(pypi_ver)
                 if gentoo_ver:
-                    # Check if this version would have valid PYTHON_COMPAT
-                    # We cache these results to avoid repeated expensive lookups
-                    if self._would_have_valid_python_compat(pypi_name, pypi_ver):
-                        gentoo_versions.append(gentoo_ver)
-                    else:
-                        logger.debug(f"Skipping {pypi_name}-{pypi_ver}: would have empty PYTHON_COMPAT")
+                    # Note: Python compat check deferred to ebuild generation time
+                    # for performance - checking every version here is too expensive
+                    gentoo_versions.append(gentoo_ver)
                     
             sorted_versions = sorted(gentoo_versions, reverse=True)  # Newest first
             
@@ -609,20 +656,19 @@ cache-formats = md5-dict
             if not pypi_name:
                 logger.debug(f"Cannot translate package name: {gentoo_name}")
                 raise FuseOSError(errno.ENOENT)
-                
+
             try:
-                # Check if the PyPI package exists (this will use cached versions)
-                versions = self._get_package_versions(pypi_name)
-                if not versions:
-                    logger.debug(f"No versions found for PyPI package: {pypi_name}")
+                # Use lightweight existence check instead of full version listing
+                if not self._package_exists(pypi_name):
+                    logger.debug(f"Package not found on PyPI: {pypi_name}")
                     raise FuseOSError(errno.ENOENT)
-                    
-                # Additional check for ebuild files
+
+                # For ebuild files, verify the specific version exists
                 if parsed['type'] == 'ebuild':
-                    if parsed['version'] not in versions:
+                    if not self._version_exists(pypi_name, parsed['version']):
                         logger.debug(f"Version {parsed['version']} not found for {pypi_name}")
                         raise FuseOSError(errno.ENOENT)
-                        
+
             except FuseOSError:
                 # Re-raise FUSE errors
                 raise
