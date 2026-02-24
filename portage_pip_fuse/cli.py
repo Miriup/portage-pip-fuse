@@ -18,6 +18,7 @@ from pathlib import Path
 
 from portage_pip_fuse.filesystem import mount_filesystem, PortagePipFS
 from portage_pip_fuse.package_filter import FilterRegistry
+from portage_pip_fuse.sqlite_metadata import SQLiteMetadataBackend
 
 
 def signal_handler(signum, frame):
@@ -76,8 +77,57 @@ def check_fuse_availability():
         sys.exit(1)
 
 
+def sync_command():
+    """Handle sync subcommand."""
+    sync_parser = argparse.ArgumentParser(
+        prog='portage-pip-fuse sync',
+        description='Sync PyPI metadata database with latest data'
+    )
+    
+    sync_parser.add_argument(
+        '--cache-dir',
+        type=str,
+        help='Cache directory for PyPI metadata database'
+    )
+    
+    sync_parser.add_argument(
+        '-d', '--debug',
+        action='store_true',
+        help='Enable debug output'
+    )
+    
+    # Remove 'sync' from argv and parse remaining args
+    sync_argv = [arg for arg in sys.argv[1:] if arg != 'sync']
+    args = sync_parser.parse_args(sync_argv)
+    
+    # Set up logging
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(level=log_level, format='%(levelname)s: %(message)s')
+    
+    # Create SQLite backend and sync
+    try:
+        cache_dir = Path(args.cache_dir) if args.cache_dir else None
+        backend = SQLiteMetadataBackend(cache_dir=cache_dir)
+        
+        success = backend.sync_database()
+        if success:
+            print("✓ Database sync completed successfully")
+            return 0
+        else:
+            print("✗ Database sync failed")
+            return 1
+            
+    except Exception as e:
+        print(f"✗ Error during sync: {e}")
+        return 1
+
+
 def main():
     """Main CLI entry point."""
+    # Handle subcommands - check for sync anywhere in the args
+    if 'sync' in sys.argv:
+        return sync_command()
+        
     parser = argparse.ArgumentParser(
         prog='portage-pip-fuse',
         description='Mount a FUSE filesystem that bridges PyPI packages to Gentoo portage',
@@ -88,6 +138,8 @@ Examples:
   %(prog)s /mnt/pypi -f -d                     # Mount with debug output
   %(prog)s /mnt/pypi -d --logfile /var/log/pypi.log  # Debug to logfile
   %(prog)s /mnt/pypi --cache-ttl 600           # Mount with 10-minute cache
+  %(prog)s sync                                # Sync PyPI database
+  %(prog)s sync --cache-dir ~/.cache/pypi      # Sync to custom directory
   
 After mounting, you can:
   ls /mnt/pypi/dev-python/requests
@@ -101,6 +153,7 @@ To unmount:
     
     parser.add_argument(
         'mountpoint',
+        nargs='?',  # Make mountpoint optional for test mode
         help='Directory where the filesystem will be mounted'
     )
     
@@ -196,6 +249,19 @@ To unmount:
     )
     
     parser.add_argument(
+        '--use-sqlite',
+        action='store_true',
+        default=True,
+        help='Use SQLite backend with PyPI JSON API fallback (default: enabled)'
+    )
+    
+    parser.add_argument(
+        '--no-sqlite',
+        action='store_true',
+        help='Disable SQLite backend and use only PyPI JSON API'
+    )
+    
+    parser.add_argument(
         '--version',
         action='version',
         version='%(prog)s 0.1.0'
@@ -265,11 +331,25 @@ To unmount:
     
     logger = logging.getLogger(__name__)
     
+    # Determine backend configuration
+    use_sqlite = args.use_sqlite and not args.no_sqlite
+    
+    # Build filter configuration dictionary
+    filter_config = {
+        'active_filters': list(active_filters),
+        'deps_for': args.deps_for or [],
+        'use_flags': use_flags,
+        'days': args.filter_days,
+        'count': args.filter_count,
+        'no_timestamps': args.no_timestamps,
+        'use_sqlite': use_sqlite
+    }
+    
     if args.test:
         # Run tests
         print("Running portage-pip-fuse tests...")
         try:
-            fs = PortagePipFS(cache_ttl=args.cache_ttl, cache_dir=args.cache_dir)
+            fs = PortagePipFS(cache_ttl=args.cache_ttl, cache_dir=args.cache_dir, filter_config=filter_config)
             print("✓ Filesystem initialization successful")
             
             # Test path parsing
@@ -290,28 +370,25 @@ To unmount:
             print(f"✗ Test failed: {e}")
             return 1
     
-    # Check system requirements
-    check_fuse_availability()
-    
-    # Validate mountpoint
-    mountpoint = validate_mountpoint(args.mountpoint)
+    # Check system requirements only if not testing
+    if not args.test:
+        if not args.mountpoint:
+            parser.error("mountpoint is required when not using --test")
+            
+        check_fuse_availability()
+        
+        # Validate mountpoint
+        mountpoint = validate_mountpoint(args.mountpoint)
+    else:
+        mountpoint = None
     
     # Set up signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Build filter configuration dictionary
-    filter_config = {
-        'active_filters': list(active_filters),
-        'deps_for': args.deps_for or [],
-        'use_flags': use_flags,
-        'days': args.filter_days,
-        'count': args.filter_count,
-        'no_timestamps': args.no_timestamps
-    }
-    
     print(f"Mounting portage-pip FUSE filesystem at {mountpoint}")
     print(f"Cache TTL: {args.cache_ttl} seconds")
+    print(f"Backend: {'SQLite + JSON API fallback' if use_sqlite else 'JSON API only'}")
     print(f"Active filters: {', '.join(active_filters) if active_filters else 'none'}")
     
     if 'deps' in active_filters and args.deps_for:

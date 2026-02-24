@@ -26,6 +26,7 @@ from fuse import FUSE, FuseOSError, Operations
 from .constants import REPO_NAME
 from .prefetcher import create_prefetched_translator
 from .pip_metadata import PyPIMetadataExtractor, EbuildDataExtractor
+from .hybrid_metadata import HybridMetadataExtractor
 from .prefetcher import PyPIPrefetcher
 from .package_filter import (
     FilterBase, FilterAll, FilterCurated, FilterRecent, 
@@ -92,7 +93,14 @@ class PortagePipFS(Operations):
         
         # Name translation components
         self.name_translator = create_prefetched_translator()
-        self.pypi_extractor = PyPIMetadataExtractor(cache_ttl=cache_ttl, cache_dir=cache_dir)
+        
+        # Choose metadata extractor based on configuration
+        use_sqlite = filter_config.get('use_sqlite', True) if filter_config else True
+        if use_sqlite:
+            self.pypi_extractor = HybridMetadataExtractor(cache_ttl=cache_ttl, cache_dir=cache_dir)
+        else:
+            self.pypi_extractor = PyPIMetadataExtractor(cache_ttl=cache_ttl, cache_dir=cache_dir)
+            
         self.ebuild_extractor = EbuildDataExtractor()
         
         # Static overlay structure
@@ -989,6 +997,16 @@ cache-formats = md5-dict
                 logger.warning(f"Failed to get manifest entry for {pypi_name} {pypi_version}: {e}")
                 
         return '\n'.join(manifest_lines) + ('\n' if manifest_lines else '')
+    
+    def destroy(self, path):
+        """Called when filesystem is being unmounted - print performance stats."""
+        logger.info("Filesystem unmounting - performance summary:")
+        if hasattr(self.pypi_extractor, 'print_performance_stats'):
+            self.pypi_extractor.print_performance_stats()
+        
+        # Close the extractor properly
+        if hasattr(self.pypi_extractor, 'close'):
+            self.pypi_extractor.close()
 
 
 def mount_filesystem(mountpoint: str, foreground: bool = False, debug: bool = False, 
