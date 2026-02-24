@@ -36,6 +36,7 @@ from .version_filter import (
     VersionFilterRegistry,
     VersionFilterChain
 )
+from .profiling import timed_operation, TimingContext, print_timing_stats
 
 # Import gs-pypi version parsing
 try:
@@ -70,6 +71,7 @@ class PortagePipFS(Operations):
     - Thin overlay layout with on-demand content generation
     """
     
+    @timed_operation("filesystem.__init__")
     def __init__(self, root: str = "/", cache_ttl: int = 3600, cache_dir: Optional[str] = None, 
                  filter_config: Optional[Dict] = None):
         """
@@ -313,6 +315,7 @@ cache-formats = md5-dict
             logger.error(f"Failed to fetch metadata for {pypi_name}: {e}")
             return None
     
+    @timed_operation("filesystem._would_have_valid_python_compat")
     def _would_have_valid_python_compat(self, pypi_name: str, version: str) -> bool:
         """
         Check if this version would have valid PYTHON_COMPAT entries.
@@ -360,6 +363,7 @@ cache-formats = md5-dict
         except Exception:
             return None
             
+    @timed_operation("filesystem._get_package_versions")
     def _get_package_versions(self, pypi_name: str) -> List[str]:
         """Get available Gentoo versions for a PyPI package."""
         # Check if we have cached versions for this package
@@ -504,6 +508,7 @@ cache-formats = md5-dict
         # Return empty list - we don't have any extended attributes
         return []
         
+    @timed_operation("filesystem.getattr")
     def getattr(self, path, fh=None):
         """Get file attributes."""
         parsed = self._parse_path(path)
@@ -671,6 +676,7 @@ cache-formats = md5-dict
             
         return attrs
             
+    @timed_operation("filesystem.readdir")
     def readdir(self, path, fh):
         """Read directory contents."""
         parsed = self._parse_path(path)
@@ -745,6 +751,7 @@ cache-formats = md5-dict
         
         return entries
         
+    @timed_operation("filesystem.read")
     def read(self, path, length, offset, fh):
         """Read file contents."""
         # Check static files first
@@ -983,6 +990,11 @@ cache-formats = md5-dict
                 logger.warning(f"Failed to get manifest entry for {pypi_name} {pypi_version}: {e}")
                 
         return '\n'.join(manifest_lines) + ('\n' if manifest_lines else '')
+    
+    def destroy(self, path):
+        """Clean shutdown - print profiling statistics."""
+        logger.info("Shutting down filesystem...")
+        print_timing_stats()
 
 
 def mount_filesystem(mountpoint: str, foreground: bool = False, debug: bool = False, 

@@ -39,6 +39,8 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
+from .profiling import timed_operation
+
 logger = logging.getLogger(__name__)
 
 
@@ -230,6 +232,7 @@ class PyPIMetadataExtractor:
                 logger.warning(f"Failed to create pip session: {e}")
         return self._session
     
+    @timed_operation("pip_metadata.get_package_json")
     def get_package_json(self, package_name: str, 
                         version: Optional[str] = None) -> Optional[Dict]:
         """
@@ -658,6 +661,7 @@ class PyPIMetadataExtractor:
         
         return runtime_deps, optional_deps
     
+    @timed_operation("pip_metadata.get_complete_package_info")
     def get_complete_package_info(self, package_name: str, 
                                  version: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
@@ -827,6 +831,7 @@ class EbuildDataExtractor:
         cls._cache_timestamp = current_time
         return fallback
     
+    @timed_operation("ebuild_extractor.format_python_compat")
     def format_python_compat(self, python_versions: List[str]) -> str:
         """
         Format Python versions for PYTHON_COMPAT variable.

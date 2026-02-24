@@ -23,6 +23,8 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Set, Optional, Any
 from pathlib import Path
 
+from .profiling import timed_operation
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,6 +95,7 @@ class VersionFilterSourceDist(VersionFilterBase):
     which are not suitable for Gentoo's build-from-source philosophy.
     """
     
+    @timed_operation("version_filter.source_dist")
     def filter_versions(self, pypi_name: str, versions_metadata: Dict[str, Dict]) -> Dict[str, Dict]:
         """Filter to only versions with source distributions."""
         filtered = {}
@@ -253,6 +256,7 @@ class VersionFilterPythonCompat(VersionFilterBase):
         cls._cache_timestamp = current_time
         return fallback
     
+    @timed_operation("version_filter.python_compat")
     def filter_versions(self, pypi_name: str, versions_metadata: Dict[str, Dict]) -> Dict[str, Dict]:
         """Filter to only Python-compatible versions."""
         filtered = {}
@@ -267,22 +271,80 @@ class VersionFilterPythonCompat(VersionFilterBase):
         info = metadata.get('info', metadata)
         requires_python = info.get('requires_python', '')
         
-        # Check version-specific Python versions if provided
-        # This is more accurate than classifiers from the latest version
+        # If we have requires_python, use that as the primary constraint
+        # This is more reliable than classifiers which are often conservative
+        if requires_python:
+            # Check if any valid Python implementation satisfies the requirement
+            # This handles cases like ">=3.10" which work with 3.11, 3.12, etc.
+            try:
+                from packaging.specifiers import SpecifierSet
+                spec = SpecifierSet(requires_python)
+                
+                # Check if ANY current valid Python satisfies the requirement
+                for impl in self.valid_impls:
+                    if impl.startswith('python3_'):
+                        # Handle both python3_11 and python3_13t
+                        suffix = impl[8:]  # Remove 'python3_'
+                        if suffix.endswith('t'):  # Free-threading build
+                            version_part = suffix[:-1]  # Remove 't' suffix
+                        else:
+                            version_part = suffix
+                        
+                        try:
+                            py_version = f"3.{version_part}"
+                            if py_version in spec:
+                                # At least one valid Python version satisfies the requirement
+                                return True
+                        except ValueError:
+                            continue
+                
+                logger.debug(f"Version {version} of {pypi_name} requires Python {requires_python}, "
+                           f"no valid Gentoo Python satisfies this")
+                return False
+                
+            except Exception as e:
+                logger.warning(f"Could not parse requires_python '{requires_python}': {e}")
+                # Fall through to classifier check
+        
+        # Fallback to version-specific Python versions from classifiers
+        # But be more lenient - if they support an older Python, they likely support newer ones
         python_versions = metadata.get('python_versions', [])
         
         if python_versions:
-            # Check if ANY declared version is in valid implementations
-            has_valid_impl = False
+            # Be lenient: if they declare support for Python 3.10 and we have 3.11+,
+            # it's likely to work (especially if requires_python wasn't set)
+            min_declared_version = None
             for ver in python_versions:
-                impl_name = f"python{ver.replace('.', '_')}"
-                if impl_name in self.valid_impls:
-                    has_valid_impl = True
-                    break
+                if ver and '.' in ver:
+                    try:
+                        major, minor = ver.split('.')
+                        if major == '3':
+                            minor_int = int(minor)
+                            if min_declared_version is None or minor_int < min_declared_version:
+                                min_declared_version = minor_int
+                    except (ValueError, AttributeError):
+                        continue
             
-            if not has_valid_impl:
-                logger.debug(f"Version {version} of {pypi_name} declares Python {python_versions}, "
-                           f"none are valid Gentoo implementations - filtering out")
+            # If they support Python 3.10 and we have 3.11+, allow it
+            # This is reasonable because newer Python versions are generally backward compatible
+            if min_declared_version is not None:
+                # Check if we have any Python >= the minimum declared version
+                for impl in self.valid_impls:
+                    if impl.startswith('python3_'):
+                        suffix = impl[8:]
+                        if suffix.endswith('t'):
+                            suffix = suffix[:-1]
+                        try:
+                            impl_minor = int(suffix)
+                            if impl_minor >= min_declared_version:
+                                logger.debug(f"Version {version} of {pypi_name} declares Python 3.{min_declared_version}+, "
+                                           f"allowing with Python {impl}")
+                                return True
+                        except ValueError:
+                            continue
+                
+                logger.debug(f"Version {version} of {pypi_name} requires Python 3.{min_declared_version}, "
+                           f"but we only have newer versions - filtering out")
                 return False
         else:
             # Fallback to classifiers if no version-specific data
@@ -399,6 +461,7 @@ class VersionFilterLatest(VersionFilterBase):
         """
         self.max_versions = max_versions
     
+    @timed_operation("version_filter.latest")
     def filter_versions(self, pypi_name: str, versions_metadata: Dict[str, Dict]) -> Dict[str, Dict]:
         """Keep only the latest N versions."""
         if len(versions_metadata) <= self.max_versions:
@@ -447,6 +510,7 @@ class VersionFilterChain:
         """
         self.filters = filters
     
+    @timed_operation("version_filter.chain")
     def filter_versions(self, pypi_name: str, versions_metadata: Dict[str, Dict]) -> Dict[str, Dict]:
         """Apply all filters to the version list."""
         filtered = versions_metadata
