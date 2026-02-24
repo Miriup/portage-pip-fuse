@@ -313,6 +313,36 @@ cache-formats = md5-dict
             logger.error(f"Failed to fetch metadata for {pypi_name}: {e}")
             return None
     
+    def _would_have_valid_python_compat(self, pypi_name: str, version: str) -> bool:
+        """
+        Check if this version would have valid PYTHON_COMPAT entries.
+        
+        This prevents listing versions that would generate empty PYTHON_COMPAT.
+        """
+        try:
+            # Get version-specific package info
+            package_info = self.pypi_extractor.get_complete_package_info(pypi_name, version)
+            if not package_info:
+                return False
+            
+            python_versions = package_info.get('python_versions', [])
+            if not python_versions:
+                # No Python version info - might be okay, let it through
+                return True
+            
+            # Check if ANY version is valid for Gentoo
+            from .pip_metadata import EbuildDataExtractor
+            extractor = EbuildDataExtractor()
+            python_compat = extractor.format_python_compat(python_versions)
+            
+            # If PYTHON_COMPAT would be empty, don't show this version
+            return len(python_compat) > 0
+            
+        except Exception as e:
+            logger.debug(f"Error checking Python compat for {pypi_name}-{version}: {e}")
+            # On error, be permissive
+            return True
+    
     def _translate_version(self, pypi_version: str) -> Optional[str]:
         """Translate PyPI version to Gentoo format."""
         if PypiVersion is None:
@@ -358,7 +388,10 @@ cache-formats = md5-dict
                     # Each version needs metadata with urls for source-dist filter
                     versions_metadata[version] = {
                         'urls': release_info,  # Release info contains list of files
-                        'info': json_data.get('info', {})  # Package info for python compat
+                        'info': json_data.get('info', {}),  # Package info (for requires_python)
+                        # We'll add a lazy load mechanism for python_versions later
+                        'pypi_name': pypi_name,
+                        'version': version
                     }
                 
                 # Apply filters
@@ -373,7 +406,13 @@ cache-formats = md5-dict
                     
                 gentoo_ver = self._translate_version(pypi_ver)
                 if gentoo_ver:
-                    gentoo_versions.append(gentoo_ver)
+                    # Additional check: would this version have valid PYTHON_COMPAT?
+                    # We need to check if the package would have any valid Python implementations
+                    # This prevents showing versions with empty PYTHON_COMPAT
+                    if self._would_have_valid_python_compat(pypi_name, pypi_ver):
+                        gentoo_versions.append(gentoo_ver)
+                    else:
+                        logger.debug(f"Skipping {pypi_name}-{pypi_ver}: would have empty PYTHON_COMPAT")
                     
             sorted_versions = sorted(gentoo_versions, reverse=True)  # Newest first
             

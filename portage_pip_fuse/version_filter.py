@@ -267,8 +267,45 @@ class VersionFilterPythonCompat(VersionFilterBase):
         info = metadata.get('info', metadata)
         requires_python = info.get('requires_python', '')
         
+        # Check version-specific Python versions if provided
+        # This is more accurate than classifiers from the latest version
+        python_versions = metadata.get('python_versions', [])
+        
+        if python_versions:
+            # Check if ANY declared version is in valid implementations
+            has_valid_impl = False
+            for ver in python_versions:
+                impl_name = f"python{ver.replace('.', '_')}"
+                if impl_name in self.valid_impls:
+                    has_valid_impl = True
+                    break
+            
+            if not has_valid_impl:
+                logger.debug(f"Version {version} of {pypi_name} declares Python {python_versions}, "
+                           f"none are valid Gentoo implementations - filtering out")
+                return False
+        else:
+            # Fallback to classifiers if no version-specific data
+            classifiers = info.get('classifiers', [])
+            declared_versions = self._extract_python_versions_from_classifiers(classifiers)
+            
+            if declared_versions:
+                # Check if ANY declared version is in valid implementations
+                has_valid_impl = False
+                for ver in declared_versions:
+                    impl_name = f"python{ver.replace('.', '_')}"
+                    if impl_name in self.valid_impls:
+                        has_valid_impl = True
+                        break
+                
+                if not has_valid_impl:
+                    logger.debug(f"Version {version} of {pypi_name} declares Python {declared_versions}, "
+                               f"none are valid Gentoo implementations")
+                    return False
+        
         if not requires_python:
             # No requirement - check if we have ANY valid Python implementation
+            # But if declared_versions were all invalid, we already returned False above
             return len(self.supported_pythons) > 0
         
         # Check if any valid Python implementation satisfies the requirement
@@ -320,6 +357,26 @@ class VersionFilterPythonCompat(VersionFilterBase):
             logger.warning(f"Could not parse Python requirement '{requires_python}': {e}")
             # Be permissive on parse errors - let it through if we have valid Pythons
             return len(self.supported_pythons) > 0
+    
+    def _extract_python_versions_from_classifiers(self, classifiers: List[str]) -> List[str]:
+        """
+        Extract Python versions from PyPI classifiers.
+        
+        Looks for classifiers like:
+        - Programming Language :: Python :: 3.8
+        - Programming Language :: Python :: 3.9
+        """
+        versions = []
+        for classifier in classifiers:
+            # Match "Programming Language :: Python :: X.Y"
+            if ':: Python ::' in classifier:
+                parts = classifier.split('::')
+                if len(parts) >= 3:
+                    version = parts[-1].strip()
+                    # Check if it looks like a version number
+                    if '.' in version and version[0].isdigit():
+                        versions.append(version)
+        return versions
     
     def get_description(self) -> str:
         """Get description of this filter."""
