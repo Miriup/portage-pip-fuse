@@ -713,7 +713,7 @@ cache-formats = md5-dict
                     content = self._generate_metadata_xml(pypi_name)
                     attrs['st_size'] = len(content.encode('utf-8'))
                 elif parsed['type'] == 'manifest':
-                    content = self._generate_manifest(pypi_name, parsed['version'])
+                    content = self._generate_manifest(parsed['category'], parsed['package'])
                     attrs['st_size'] = len(content.encode('utf-8'))
                 else:
                     # Try to get cached content as fallback
