@@ -446,6 +446,14 @@ class SQLiteMetadataBackend:
             # Decompress gzipped SQLite file
             print("🗜️  Decompressing database...")
 
+            # Use .__decompress__ suffix for in-progress decompression (like download)
+            decompress_path = Path(str(self.db_path) + '.__decompress__')
+
+            # Clean up any previous partial decompression
+            if decompress_path.exists():
+                print("🔄 Removing partial decompression from previous run...")
+                decompress_path.unlink()
+
             # Get compressed file size for progress
             compressed_size = final_gz_path.stat().st_size
 
@@ -456,7 +464,7 @@ class SQLiteMetadataBackend:
                 with tqdm(total=progress_total, unit='B', unit_scale=True, unit_divisor=1024,
                         desc="🗜️  Decompress", ncols=80, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
                     with gzip.open(final_gz_path, 'rb') as gz_file:
-                        with open(self.db_path, 'wb') as db_file:
+                        with open(decompress_path, 'wb') as db_file:
                             processed = 0
                             while True:
                                 chunk = gz_file.read(1024 * 1024)  # 1MB chunks
@@ -472,7 +480,7 @@ class SQLiteMetadataBackend:
             else:
                 # Simple decompression without detailed progress
                 with gzip.open(final_gz_path, 'rb') as gz_file:
-                    with open(self.db_path, 'wb') as db_file:
+                    with open(decompress_path, 'wb') as db_file:
                         processed = 0
                         start_time = time.time()
                         while True:
@@ -501,7 +509,10 @@ class SQLiteMetadataBackend:
                                     print(f"\r🗜️  Processed: {self._format_size(processed)}", end='', flush=True)
                                 db_file.flush()
                 print()  # New line after decompression
-                    
+
+            # Rename decompressed file to final name (atomic operation)
+            decompress_path.rename(self.db_path)
+
             # Clean up compressed file after successful decompression
             final_gz_path.unlink()
             
