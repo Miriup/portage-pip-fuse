@@ -101,7 +101,7 @@ class PortagePipFS(Operations):
         else:
             self.pypi_extractor = PyPIMetadataExtractor(cache_ttl=cache_ttl, cache_dir=cache_dir)
             
-        self.ebuild_extractor = EbuildDataExtractor()
+        self.ebuild_extractor = EbuildDataExtractor(cache_dir=cache_dir)
         
         # Static overlay structure
         self.static_dirs = {

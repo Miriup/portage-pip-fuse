@@ -60,6 +60,9 @@ class HybridMetadataExtractor:
             enable_fallback: Enable fallback to PyPI JSON API
             sqlite_max_age_days: Maximum age for SQLite database staleness
         """
+        # Store cache_dir for access by other components
+        self.cache_dir = cache_dir
+
         # SQLite backend (primary)
         self.sqlite_backend = SQLiteMetadataBackend(
             cache_dir=cache_dir,

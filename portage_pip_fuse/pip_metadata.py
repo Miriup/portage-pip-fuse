@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import re
-import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Set
@@ -38,6 +37,8 @@ try:
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
+
+from portage_pip_fuse.constants import find_cache_dir
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +77,8 @@ class PyPIMetadataExtractor:
         self.user_agent = user_agent
         self.cache_ttl = cache_ttl
         
-        # Set up cache directory
-        if cache_dir is None:
-            cache_dir = os.path.join(tempfile.gettempdir(), 'portage-pip-fuse-cache')
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Set up cache directory using find_cache_dir() for consistent location
+        self.cache_dir = find_cache_dir(cache_dir)
         
         # In-memory cache: package_name -> (data, timestamp)
         self._memory_cache: Dict[str, Tuple[dict, float]] = {}
@@ -739,9 +737,13 @@ class EbuildDataExtractor:
     _cache_timestamp = 0
     _cache_ttl = 3600  # Cache for 1 hour
     
-    def __init__(self):
-        """Initialize the ebuild data extractor."""
-        self.pypi_extractor = PyPIMetadataExtractor()
+    def __init__(self, cache_dir: Optional[str] = None):
+        """Initialize the ebuild data extractor.
+
+        Args:
+            cache_dir: Directory for caching PyPI metadata
+        """
+        self.pypi_extractor = PyPIMetadataExtractor(cache_dir=cache_dir)
         
         # PyPI to Gentoo license mapping
         self.license_map = {

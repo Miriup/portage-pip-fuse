@@ -41,8 +41,8 @@ DEFAULT_PYPI_DATA_URL = "https://github.com/pypi-data/pypi-json-data/releases/do
 # GitHub API URL for release metadata (provides SHA256 and file size)
 GITHUB_RELEASES_API_URL = "https://api.github.com/repos/pypi-data/pypi-json-data/releases/latest"
 
-# Cache directory for downloaded SQLite database
-DEFAULT_CACHE_DIR = Path.home() / '.cache' / 'portage-pip-fuse'
+# Import cache directory constant
+from portage_pip_fuse.constants import DEFAULT_CACHE_DIR
 
 # Maximum age before database is considered stale (7 days)
 DEFAULT_MAX_AGE_DAYS = 7
@@ -66,18 +66,21 @@ class SQLiteMetadataBackend:
     - Comprehensive size and staleness warnings
     """
     
-    def __init__(self, 
+    def __init__(self,
                  cache_dir: Optional[Path] = None,
                  database_url: str = DEFAULT_PYPI_DATA_URL,
                  max_age_days: int = DEFAULT_MAX_AGE_DAYS):
         """
         Initialize SQLite metadata backend.
-        
+
         Args:
-            cache_dir: Directory for caching SQLite database
+            cache_dir: Directory for caching SQLite database (Path or str)
             database_url: URL to download SQLite database from
             max_age_days: Maximum age in days before database is stale
         """
+        # Convert str to Path if needed
+        if cache_dir is not None and isinstance(cache_dir, str):
+            cache_dir = Path(cache_dir)
         self.cache_dir = cache_dir or DEFAULT_CACHE_DIR
         self.database_url = database_url
         self.max_age_days = max_age_days
