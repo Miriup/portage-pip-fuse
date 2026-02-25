@@ -1803,10 +1803,8 @@ class EbuildDataExtractor:
                 package_info.get('python_versions', [])
             ),
             
-            # Dependencies
-            'DEPEND': self.format_dependencies(
-                package_info.get('runtime_dependencies', [])
-            ),
+            # Dependencies - pure Python packages only need runtime deps
+            'DEPEND': [],  # No build-time deps for pure Python
             'RDEPEND': self.format_dependencies(
                 package_info.get('runtime_dependencies', [])
             ),
