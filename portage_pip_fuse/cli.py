@@ -242,6 +242,10 @@ def _generate_ebuild_deps(
     """
     Generate ebuild RDEPEND entries with conditional python_targets dependencies.
 
+    Uses ${PYTHON_USEDEP} to ensure dependencies are built for the same Python
+    targets as the package being installed. This is the standard Gentoo pattern
+    for Python package dependencies.
+
     Args:
         requirements: List of (name, specifier, extras, marker) tuples
 
@@ -279,6 +283,9 @@ def _generate_ebuild_deps(
     rdepend_lines = []
     extras_info = []
 
+    # PYTHON_USEDEP ensures deps are built for the same Python targets
+    usedep = '[${PYTHON_USEDEP}]'
+
     for gentoo_name in sorted(pkg_version_map.keys()):
         version_atoms = pkg_version_map[gentoo_name]
         extras = pkg_extras.get(gentoo_name, set())
@@ -291,7 +298,7 @@ def _generate_ebuild_deps(
 
         if len(unique_atoms) == 1:
             # All Python versions use the same atom - no conditional needed
-            rdepend_lines.append(f"\t{unique_atoms.pop()}")
+            rdepend_lines.append(f"\t{unique_atoms.pop()}{usedep}")
         else:
             # Different atoms for different versions - generate conditionals
             # Group by atom to minimize repetition
@@ -302,7 +309,7 @@ def _generate_ebuild_deps(
             for atom, versions in sorted(atom_to_versions.items()):
                 for py_ver in sorted(versions):
                     use_flag = f"python_targets_python{py_ver.replace('.', '_')}"
-                    rdepend_lines.append(f"\t{use_flag}? ( {atom} )")
+                    rdepend_lines.append(f"\t{use_flag}? ( {atom}{usedep} )")
 
     return rdepend_lines, extras_info
 
