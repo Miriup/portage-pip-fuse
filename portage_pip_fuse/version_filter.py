@@ -154,20 +154,32 @@ class VersionFilterPythonCompat(VersionFilterBase):
             import portage
             settings = portage.config()
             python_targets = settings.get('PYTHON_TARGETS', '').split()
-            
-            # Only consider targets that are in _PYTHON_ALL_IMPLS
-            valid_targets = [t for t in python_targets if t in valid_impls]
-            
-            # Extract version numbers from python3_11 -> 3.11
-            versions = set()
-            for target in valid_targets:
-                if target.startswith('python'):
-                    parts = target.replace('python', '').split('_')
-                    if len(parts) == 2:
-                        versions.add(f"{parts[0]}.{parts[1]}")
-            
-            if versions:
-                return versions
+
+            # Handle PYTHON_TARGETS=* (wildcard meaning all)
+            if python_targets == ['*']:
+                # Use all valid Python 3 implementations
+                versions = set()
+                for impl in valid_impls:
+                    if impl.startswith('python3_'):
+                        parts = impl.replace('python', '').split('_')
+                        if len(parts) == 2 and not parts[1].endswith('t'):  # Skip free-threading
+                            versions.add(f"{parts[0]}.{parts[1]}")
+                if versions:
+                    return versions
+            else:
+                # Only consider targets that are in _PYTHON_ALL_IMPLS
+                valid_targets = [t for t in python_targets if t in valid_impls]
+
+                # Extract version numbers from python3_11 -> 3.11
+                versions = set()
+                for target in valid_targets:
+                    if target.startswith('python'):
+                        parts = target.replace('python', '').split('_')
+                        if len(parts) == 2:
+                            versions.add(f"{parts[0]}.{parts[1]}")
+
+                if versions:
+                    return versions
         except ImportError:
             pass
         

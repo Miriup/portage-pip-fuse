@@ -363,7 +363,7 @@ cache-formats = md5-dict
                 del self._package_json_cache[pypi_name]
 
         # Fetch from extractor (which has its own cache)
-        json_data = self._get_cached_package_json(pypi_name)
+        json_data = self.pypi_extractor.get_package_json(pypi_name)
 
         # Cache the result (including None for negative caching)
         self._package_json_cache[pypi_name] = (json_data, time.time())
@@ -459,20 +459,60 @@ cache-formats = md5-dict
     
     def _translate_version(self, pypi_version: str) -> Optional[str]:
         """Translate PyPI version to Gentoo format."""
+        import re
+
         if PypiVersion is None:
-            # Fallback simple translation
-            version = pypi_version.replace('a', '_alpha').replace('b', '_beta').replace('rc', '_rc')
-            if '.dev' in version:
-                version = version.replace('.dev', '.9999.')
-            if '.post' in version:
-                version = version.replace('.post', '_p')
-            return version
-            
-        try:
-            parsed = PypiVersion.parse_version(pypi_version)
-            return str(parsed) if parsed else None
-        except Exception:
-            return None
+            # Fallback using regex patterns (same as pip_metadata.py)
+            version = pypi_version
+
+            # Handle pre-release markers (must check longer patterns first)
+            # alpha/a followed by a number
+            # Use negative lookbehind to avoid matching 'a' in already-translated '_alpha'
+            version = re.sub(r'\.?alpha(\d+)', r'_alpha\1', version)
+            version = re.sub(r'(?<![a-z])\.?a(\d+)', r'_alpha\1', version)
+
+            # beta/b followed by a number
+            # Use negative lookbehind to avoid matching 'b' in already-translated '_beta'
+            version = re.sub(r'\.?beta(\d+)', r'_beta\1', version)
+            version = re.sub(r'(?<![a-z])\.?b(\d+)', r'_beta\1', version)
+
+            # rc/c followed by a number (release candidate)
+            # Must check 'rc' first before 'c' to avoid partial match
+            version = re.sub(r'\.?rc(\d+)', r'_rc\1', version)
+            # Only match standalone 'c' not preceded by 'r' (use negative lookbehind)
+            version = re.sub(r'(?<!r)\.?c(\d+)', r'_rc\1', version)
+
+            # post release
+            version = re.sub(r'\.post(\d+)', r'_p\1', version)
+
+            # dev release
+            version = re.sub(r'\.dev(\d+)', r'_pre\1', version)
+        else:
+            try:
+                parsed = PypiVersion.parse_version(pypi_version)
+                version = str(parsed) if parsed else None
+            except Exception:
+                version = None
+
+        # Validate the translated version against Gentoo's format
+        # Valid: digits, dots, and suffixes (_alpha, _beta, _pre, _rc, _p) with optional numbers
+        # Invalid: hyphens (except -r for revision), bare letters, special chars
+        if version:
+            # Gentoo version regex based on PMS specification
+            # Format: numeric(.numeric)* with optional suffixes and revision
+            gentoo_version_re = re.compile(
+                r'^'
+                r'\d+(\.\d+)*'  # Base version: 1.2.3
+                r'([a-z])?'  # Optional single letter suffix (rare but valid)
+                r'(_alpha\d*|_beta\d*|_pre\d*|_rc\d*|_p\d*)*'  # Gentoo suffixes
+                r'(-r\d+)?'  # Optional revision
+                r'$'
+            )
+            if not gentoo_version_re.match(version):
+                logger.debug(f"Invalid Gentoo version format: {version} (from {pypi_version})")
+                return None
+
+        return version
             
     def _get_package_versions(self, pypi_name: str) -> List[str]:
         """Get available Gentoo versions for a PyPI package."""
@@ -536,8 +576,6 @@ cache-formats = md5-dict
 
                 gentoo_ver = self._translate_version(pypi_ver)
                 if gentoo_ver:
-                    # Note: Python compat check deferred to ebuild generation time
-                    # for performance - checking every version here is too expensive
                     gentoo_versions.append(gentoo_ver)
                     
             sorted_versions = sorted(gentoo_versions, reverse=True)  # Newest first
@@ -773,6 +811,9 @@ cache-formats = md5-dict
                     # Extract category from parsed path
                     category = parsed.get('category', 'dev-python')
                     content = self._generate_ebuild(category, parsed['package'], parsed['version'])
+                    if content is None:
+                        # Ebuild can't be generated (e.g., empty PYTHON_COMPAT)
+                        raise FuseOSError(errno.ENOENT)
                     attrs['st_size'] = len(content.encode('utf-8'))
                 elif parsed['type'] == 'package_metadata':
                     content = self._generate_metadata_xml(pypi_name)
@@ -785,6 +826,9 @@ cache-formats = md5-dict
                     cached = self._get_cached_content(path)
                     if cached:
                         attrs['st_size'] = len(cached)
+            except FuseOSError:
+                # Re-raise FUSE errors (including our ENOENT for invalid ebuilds)
+                raise
             except Exception as e:
                 # If content generation fails, use the default estimate
                 # This is better than failing completely
@@ -1067,7 +1111,13 @@ cache-formats = md5-dict
             if not ebuild_data:
                 logger.error(f"Failed to prepare ebuild data for {package}-{version}")
                 return None
-            
+
+            # Check if PYTHON_COMPAT would be empty - if so, hide this ebuild
+            python_compat = ebuild_data.get('PYTHON_COMPAT', [])
+            if not python_compat:
+                logger.debug(f"Hiding {package}-{version}: no valid PYTHON_COMPAT")
+                return None
+
             # Generate ebuild from template
             return self._format_ebuild(ebuild_data)
             

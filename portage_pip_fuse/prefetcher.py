@@ -52,7 +52,7 @@ class RepositoryScanner:
         self.repos_conf = repos_conf or "/etc/portage/repos.conf"
         self.repositories: Dict[str, str] = {}
         self._pypi_inherit_pattern = re.compile(r'^\s*inherit\s+.*\bpypi\b', re.MULTILINE)
-        self._pypi_pn_pattern = re.compile(r'^\s*PYPI_PN\s*=\s*["\']?([^"\']+)["\']?', re.MULTILINE)
+        self._pypi_pn_pattern = re.compile(r'^\s*PYPI_PN\s*=\s*["\']?([^"\'\n]+)["\']?', re.MULTILINE)
         self._python_compat_pattern = re.compile(r'^\s*PYTHON_COMPAT\s*=\s*\(([^)]+)\)', re.MULTILINE)
         
     def discover_repositories(self) -> Dict[str, str]:

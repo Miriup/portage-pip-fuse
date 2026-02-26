@@ -23,7 +23,34 @@ from portage_pip_fuse.filesystem import mount_filesystem, PortagePipFS
 from portage_pip_fuse.package_filter import FilterRegistry
 from portage_pip_fuse.sqlite_metadata import SQLiteMetadataBackend
 from portage_pip_fuse.constants import REPO_NAME, REPO_LOCATION, find_cache_dir
-from portage_pip_fuse.name_translator import pypi_to_gentoo
+from portage_pip_fuse.prefetcher import create_prefetched_translator
+from portage_pip_fuse.pip_metadata import EbuildDataExtractor
+
+# Lazy-initialized translator with Gentoo repository mappings
+_prefetched_translator = None
+
+
+def _get_translator():
+    """
+    Get the prefetched name translator, initializing it on first use.
+
+    This lazy initialization avoids slow startup for commands that don't
+    need name translation.
+    """
+    global _prefetched_translator
+    if _prefetched_translator is None:
+        _prefetched_translator = create_prefetched_translator()
+    return _prefetched_translator
+
+
+def pypi_to_gentoo(pypi_name: str) -> str:
+    """
+    Translate PyPI package name to Gentoo package name.
+
+    Uses the prefetched translator which has mappings from actual Gentoo
+    repositories (e.g., psycopg2 -> psycopg).
+    """
+    return _get_translator().pypi_to_gentoo(pypi_name)
 
 # Try to import pip's packaging library for requirement parsing
 try:
@@ -107,10 +134,11 @@ def _translate_pypi_version(pypi_version: str) -> str:
     version = pypi_version
 
     # Handle pre-release markers (must check longer patterns first)
+    # Use negative lookbehind to avoid matching 'a'/'b' in already-translated '_alpha'/'_beta'
     version = re.sub(r'\.?alpha(\d+)', r'_alpha\1', version)
-    version = re.sub(r'\.?a(\d+)', r'_alpha\1', version)
+    version = re.sub(r'(?<![a-z])\.?a(\d+)', r'_alpha\1', version)
     version = re.sub(r'\.?beta(\d+)', r'_beta\1', version)
-    version = re.sub(r'\.?b(\d+)', r'_beta\1', version)
+    version = re.sub(r'(?<![a-z])\.?b(\d+)', r'_beta\1', version)
     version = re.sub(r'\.?rc(\d+)', r'_rc\1', version)
     version = re.sub(r'(?<!r)\.?c(\d+)', r'_rc\1', version)
     version = re.sub(r'\.post(\d+)', r'_p\1', version)
@@ -181,14 +209,170 @@ def _format_gentoo_atom(package_name: str, specifier=None) -> str:
         return dep_parts[0]
 
 
-def _parse_requirements_file(filename: str) -> List[Tuple[str, Optional[Any], List[str]]]:
+def _evaluate_marker(marker) -> bool:
     """
-    Parse a requirements file and return list of (name, specifier, extras) tuples.
+    Evaluate a PEP 508 environment marker against all supported Python versions.
+
+    Uses the same logic as ebuild generation - evaluates against PYTHON_TARGETS
+    from the Gentoo system, not just the running interpreter.
+
+    Args:
+        marker: A packaging.markers.Marker object, or None
+
+    Returns:
+        True if the marker evaluates to true for ANY supported Python version
+    """
+    if marker is None:
+        return True
+
+    # Get all supported Python versions from Gentoo's PYTHON_TARGETS
+    supported_versions = EbuildDataExtractor._get_supported_python_versions()
+
+    # Return True if the marker matches ANY supported version
+    for py_ver in supported_versions:
+        if EbuildDataExtractor._evaluate_marker_for_python(marker, py_ver):
+            return True
+
+    return False
+
+
+def _generate_ebuild_deps(
+    requirements: List[Tuple[str, Optional[Any], List[str], Optional[Any]]]
+) -> Tuple[List[str], List[str]]:
+    """
+    Generate ebuild RDEPEND entries with conditional python_targets dependencies.
+
+    Uses ${PYTHON_USEDEP} to ensure dependencies are built for the same Python
+    targets as the package being installed. This is the standard Gentoo pattern
+    for Python package dependencies.
+
+    Args:
+        requirements: List of (name, specifier, extras, marker) tuples
+
+    Returns:
+        Tuple of (rdepend_lines, extras_info) where:
+        - rdepend_lines: List of dependency lines for RDEPEND
+        - extras_info: List of USE flag requirements to report
+    """
+    from collections import defaultdict
+
+    supported_versions = EbuildDataExtractor._get_supported_python_versions()
+
+    # Group requirements by package name and determine which Python versions need which atom
+    # Structure: {gentoo_name: {py_version: atom}}
+    pkg_version_map: Dict[str, Dict[str, str]] = defaultdict(dict)
+    pkg_extras: Dict[str, Set[str]] = defaultdict(set)
+
+    for name, specifier, extras, marker in requirements:
+        gentoo_name = pypi_to_gentoo(name)
+        atom = _format_gentoo_atom(name, specifier)
+
+        if extras:
+            pkg_extras[gentoo_name].update(extras)
+
+        # Determine which Python versions this requirement applies to
+        for py_ver in supported_versions:
+            if marker is None or EbuildDataExtractor._evaluate_marker_for_python(marker, py_ver):
+                # This requirement applies to this Python version
+                # If there's already a different atom for this version, keep the first one
+                # (requirements files typically list more specific constraints first)
+                if py_ver not in pkg_version_map[gentoo_name]:
+                    pkg_version_map[gentoo_name][py_ver] = atom
+
+    # Generate RDEPEND lines
+    rdepend_lines = []
+    extras_info = []
+
+    # PYTHON_USEDEP ensures deps are built for the same Python targets
+    usedep = '[${PYTHON_USEDEP}]'
+
+    for gentoo_name in sorted(pkg_version_map.keys()):
+        version_atoms = pkg_version_map[gentoo_name]
+        extras = pkg_extras.get(gentoo_name, set())
+
+        if extras:
+            extras_info.append(f"dev-python/{gentoo_name} {' '.join(sorted(extras))}")
+
+        # Check if all versions use the same atom
+        unique_atoms = set(version_atoms.values())
+
+        if len(unique_atoms) == 1:
+            # All Python versions use the same atom - no conditional needed
+            rdepend_lines.append(f"\t{unique_atoms.pop()}{usedep}")
+        else:
+            # Different atoms for different versions - generate conditionals
+            # Group by atom to minimize repetition
+            atom_to_versions: Dict[str, List[str]] = defaultdict(list)
+            for py_ver, atom in version_atoms.items():
+                atom_to_versions[atom].append(py_ver)
+
+            for atom, versions in sorted(atom_to_versions.items()):
+                for py_ver in sorted(versions):
+                    use_flag = f"python_targets_python{py_ver.replace('.', '_')}"
+                    rdepend_lines.append(f"\t{use_flag}? ( {atom}{usedep} )")
+
+    return rdepend_lines, extras_info
+
+
+def _generate_ebuild_content(
+    project_name: str,
+    requirements_file: str,
+    rdepend_lines: List[str],
+    python_compat: str
+) -> str:
+    """
+    Generate complete ebuild content for a virtual dependency package.
+
+    Args:
+        project_name: Name of the project (used in description)
+        requirements_file: Path to the requirements file
+        rdepend_lines: List of RDEPEND dependency lines
+        python_compat: PYTHON_COMPAT string
+
+    Returns:
+        Complete ebuild file content
+    """
+    rdepend_content = '\n'.join(rdepend_lines)
+
+    return f'''# Copyright 2026 Gentoo Authors
+# Distributed under the terms of the GNU General Public License v2
+
+EAPI=8
+
+PYTHON_COMPAT=( {python_compat} )
+
+inherit python-r1
+
+DESCRIPTION="Virtual for {project_name} dependencies (from {requirements_file})"
+HOMEPAGE=""
+SRC_URI=""
+S="${{WORKDIR}}"
+
+LICENSE="metapackage"
+SLOT="0"
+KEYWORDS="~amd64 ~x86"
+REQUIRED_USE="${{PYTHON_REQUIRED_USE}}"
+
+RDEPEND="
+\t${{PYTHON_DEPS}}
+{rdepend_content}
+"
+
+src_unpack() {{
+\tdie "This is a virtual dependency package for {project_name}, not a real package.\\nInstall the actual {project_name} package from its source."
+}}
+'''
+
+
+def _parse_requirements_file(filename: str) -> List[Tuple[str, Optional[Any], List[str], Optional[Any]]]:
+    """
+    Parse a requirements file and return list of (name, specifier, extras, marker) tuples.
 
     Handles:
     - Simple package names: requests
     - Versioned packages: requests>=2.0
     - Extras: requests[security]
+    - Environment markers: requests; python_version < '3.11'
     - Comments and blank lines
     - Line continuations (\\)
     - Environment variables (${VAR})
@@ -197,7 +381,7 @@ def _parse_requirements_file(filename: str) -> List[Tuple[str, Optional[Any], Li
         filename: Path to requirements file
 
     Returns:
-        List of (package_name, specifier, extras) tuples
+        List of (package_name, specifier, extras, marker) tuples
     """
     requirements = []
 
@@ -265,7 +449,7 @@ def _parse_requirements_file(filename: str) -> List[Tuple[str, Optional[Any], Li
         # Parse the requirement
         try:
             req = Requirement(line)
-            requirements.append((req.name, req.specifier, list(req.extras)))
+            requirements.append((req.name, req.specifier, list(req.extras), req.marker))
         except (InvalidRequirement, ValueError) as e:
             print(f"Warning: Skipping invalid requirement at line {line_num}: {line}")
             print(f"  Error: {e}")
@@ -274,23 +458,165 @@ def _parse_requirements_file(filename: str) -> List[Tuple[str, Optional[Any], Li
     return requirements
 
 
+def _get_project_metadata(start_dir: str = None) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Detect project name and version from pyproject.toml, setup.cfg, or setup.py.
+
+    Searches starting from the given directory (or cwd) up to the root.
+
+    Args:
+        start_dir: Directory to start searching from (default: current directory)
+
+    Returns:
+        Tuple of (name, version), either may be None if not found
+    """
+    if start_dir is None:
+        start_dir = os.getcwd()
+
+    search_dir = Path(start_dir).resolve()
+
+    while search_dir != search_dir.parent:
+        # Try pyproject.toml first
+        pyproject = search_dir / 'pyproject.toml'
+        if pyproject.exists():
+            try:
+                content = pyproject.read_text()
+                name = None
+                version = None
+
+                # Look for [project] section
+                name_match = re.search(
+                    r'^\s*\[project\]\s*$.*?^\s*name\s*=\s*["\']([^"\']+)["\']',
+                    content, re.MULTILINE | re.DOTALL
+                )
+                if name_match:
+                    name = name_match.group(1)
+
+                version_match = re.search(
+                    r'^\s*\[project\]\s*$.*?^\s*version\s*=\s*["\']([^"\']+)["\']',
+                    content, re.MULTILINE | re.DOTALL
+                )
+                if version_match:
+                    version = version_match.group(1)
+
+                # Also try [tool.poetry]
+                if not name:
+                    name_match = re.search(
+                        r'^\s*\[tool\.poetry\]\s*$.*?^\s*name\s*=\s*["\']([^"\']+)["\']',
+                        content, re.MULTILINE | re.DOTALL
+                    )
+                    if name_match:
+                        name = name_match.group(1)
+
+                if not version:
+                    version_match = re.search(
+                        r'^\s*\[tool\.poetry\]\s*$.*?^\s*version\s*=\s*["\']([^"\']+)["\']',
+                        content, re.MULTILINE | re.DOTALL
+                    )
+                    if version_match:
+                        version = version_match.group(1)
+
+                if name:
+                    return name, version
+            except Exception:
+                pass
+
+        # Try setup.cfg
+        setup_cfg = search_dir / 'setup.cfg'
+        if setup_cfg.exists():
+            try:
+                content = setup_cfg.read_text()
+                name = None
+                version = None
+
+                name_match = re.search(
+                    r'^\s*\[metadata\]\s*$.*?^\s*name\s*=\s*(.+?)\s*$',
+                    content, re.MULTILINE | re.DOTALL
+                )
+                if name_match:
+                    name = name_match.group(1).strip()
+
+                version_match = re.search(
+                    r'^\s*\[metadata\]\s*$.*?^\s*version\s*=\s*(.+?)\s*$',
+                    content, re.MULTILINE | re.DOTALL
+                )
+                if version_match:
+                    version = version_match.group(1).strip()
+
+                if name:
+                    return name, version
+            except Exception:
+                pass
+
+        # Try setup.py with simple regex
+        setup_py = search_dir / 'setup.py'
+        if setup_py.exists():
+            try:
+                content = setup_py.read_text()
+                name = None
+                version = None
+
+                name_match = re.search(r'name\s*=\s*["\']([^"\']+)["\']', content)
+                if name_match:
+                    name = name_match.group(1)
+
+                version_match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', content)
+                if version_match:
+                    version = version_match.group(1)
+
+                if name:
+                    return name, version
+            except Exception:
+                pass
+
+        search_dir = search_dir.parent
+
+    return None, None
+
+
+def _get_project_name(start_dir: str = None) -> Optional[str]:
+    """
+    Detect project name from pyproject.toml, setup.cfg, or setup.py.
+
+    Searches starting from the given directory (or cwd) up to the root.
+
+    Args:
+        start_dir: Directory to start searching from (default: current directory)
+
+    Returns:
+        Project name if found, None otherwise
+    """
+    name, _ = _get_project_metadata(start_dir)
+    return name
+
+
 def _derive_set_name(requirements_file: str) -> str:
     """
-    Derive a portage set name from a requirements file path.
+    Derive a portage set name from the project name or requirements file path.
+
+    First tries to detect the project name from pyproject.toml, setup.cfg,
+    or setup.py. Falls back to using the requirements file path.
 
     Examples:
+        (with pyproject.toml name="odoo") -> odoo-dependencies
         requirements.txt -> requirements-dependencies
         my-project/requirements.txt -> my-project-dependencies
         requirements-dev.txt -> requirements-dev-dependencies
     """
-    path = Path(requirements_file)
+    # First, try to get project name from project metadata
+    req_dir = Path(requirements_file).resolve().parent
+    project_name = _get_project_name(str(req_dir))
 
-    # Get the filename without extension
-    name = path.stem
+    if project_name:
+        name = project_name
+    else:
+        # Fall back to filename/directory based naming
+        path = Path(requirements_file)
+        name = path.stem
 
-    # If it's just "requirements", use parent directory name if available
-    if name == 'requirements' and path.parent.name and path.parent.name != '.':
-        name = path.parent.name
+        # If it's just "requirements", use parent directory name if available
+        if name == 'requirements' and path.parent.name and path.parent.name != '.':
+            name = path.parent.name
 
     # Sanitize the name for portage (lowercase, hyphens only)
     name = re.sub(r'[^a-zA-Z0-9-]', '-', name.lower())
@@ -413,6 +739,14 @@ Then runs: emerge @{project}-dependencies
         help='Include pre-release versions (passed as ~arch keyword)'
     )
 
+    pip_parser.add_argument(
+        '--deps-overlay',
+        type=str,
+        metavar='PATH',
+        help='Generate a virtual dependency ebuild in the specified overlay. '
+             'Creates virtual/{PN}/{PN}-{PV}.ebuild with proper python_targets_* conditionals.'
+    )
+
     # Remove 'pip' from argv and parse remaining args
     pip_argv = []
     skip_next = False
@@ -437,8 +771,9 @@ Then runs: emerge @{project}-dependencies
         print("  Skipping:", ', '.join(args.editables))
 
     # Collect all packages to install
-    all_packages: List[Tuple[str, Optional[Any], List[str]]] = []
+    all_packages: List[Tuple[str, Optional[Any], List[str], Optional[Any]]] = []
     set_files_created: List[Tuple[str, str]] = []  # (filename, set_name)
+    skipped_markers: List[Tuple[str, str]] = []  # (name, marker) for reporting
 
     # Parse direct package arguments
     if args.packages:
@@ -449,16 +784,98 @@ Then runs: emerge @{project}-dependencies
             if Requirement is not None:
                 try:
                     req = Requirement(pkg_spec)
-                    all_packages.append((req.name, req.specifier, list(req.extras)))
+                    # Check environment marker
+                    if not _evaluate_marker(req.marker):
+                        skipped_markers.append((req.name, str(req.marker)))
+                        continue
+                    all_packages.append((req.name, req.specifier, list(req.extras), req.marker))
                 except (InvalidRequirement, ValueError) as e:
                     print(f"Warning: Invalid package specifier: {pkg_spec}")
                     print(f"  Error: {e}")
             else:
                 # Fallback: just use the name
-                all_packages.append((pkg_spec, None, []))
+                all_packages.append((pkg_spec, None, [], None))
 
     # Parse requirements files
     if args.requirements:
+        # Handle --deps-overlay mode
+        if args.deps_overlay:
+            # Combine all requirements files for ebuild generation
+            all_reqs = []
+            for req_file in args.requirements:
+                reqs = _parse_requirements_file(req_file)
+                if reqs:
+                    all_reqs.extend(reqs)
+
+            if not all_reqs:
+                print("Error: No valid requirements found")
+                return 1
+
+            # Get project name and version
+            req_dir = Path(args.requirements[0]).resolve().parent
+            project_name, project_version = _get_project_metadata(str(req_dir))
+
+            if not project_name:
+                print("Error: Could not detect project name from pyproject.toml, setup.cfg, or setup.py")
+                print("Make sure you're running from a Python project directory")
+                return 1
+
+            if not project_version:
+                print("Warning: Could not detect project version, using '9999'")
+                project_version = '9999'
+
+            # Translate version to Gentoo format
+            gentoo_version = _translate_pypi_version(project_version)
+
+            # Get PYTHON_COMPAT
+            supported_versions = EbuildDataExtractor._get_supported_python_versions()
+            python_compat = ' '.join(f"python{v.replace('.', '_')}" for v in supported_versions)
+
+            # Generate ebuild dependencies (includes ALL requirements with markers)
+            rdepend_lines, extras_info = _generate_ebuild_deps(all_reqs)
+
+            # Generate ebuild content
+            ebuild_content = _generate_ebuild_content(
+                project_name,
+                ', '.join(args.requirements),
+                rdepend_lines,
+                python_compat
+            )
+
+            # Report extras as USE flags
+            if extras_info:
+                print("\nNote: The following packages require USE flags:")
+                print("Add to /etc/portage/package.use:")
+                for info in extras_info:
+                    print(f"  {info}")
+                print()
+
+            # Construct ebuild path: <overlay>/virtual/<PN>/<PN>-<PV>.ebuild
+            overlay_path = Path(args.deps_overlay)
+            pkg_name = pypi_to_gentoo(project_name)
+            ebuild_dir = overlay_path / 'virtual' / pkg_name
+            ebuild_path = ebuild_dir / f'{pkg_name}-{gentoo_version}.ebuild'
+
+            if args.dry_run:
+                print(f"\n--- Would create {ebuild_path} ---")
+                print(ebuild_content)
+                print(f"--- End {ebuild_path} ---\n")
+            else:
+                try:
+                    ebuild_dir.mkdir(parents=True, exist_ok=True)
+                    ebuild_path.write_text(ebuild_content)
+                    print(f"Created ebuild: {ebuild_path}")
+                    print(f"\nTo install, run:")
+                    print(f"  ebuild {ebuild_path} manifest")
+                    print(f"  emerge -av =virtual/{pkg_name}-{gentoo_version}")
+                except PermissionError:
+                    print(f"Error: Permission denied writing {ebuild_path}")
+                    print("Try running with sudo or check overlay permissions")
+                    return 1
+
+            return 0
+
+        # Standard set file generation
         set_dir = Path(args.set_dir)
 
         for req_file in args.requirements:
@@ -479,15 +896,54 @@ Then runs: emerge @{project}-dependencies
                 ""
             ]
 
-            for name, specifier, extras in reqs:
+            # Filter by environment markers
+            filtered_reqs = []
+            for name, specifier, extras, marker in reqs:
+                if not _evaluate_marker(marker):
+                    skipped_markers.append((name, str(marker)))
+                    continue
+                filtered_reqs.append((name, specifier, extras, marker))
+
+            # Deduplicate: group by package name and merge versions
+            # This handles cases where different Python versions need different package versions
+            from collections import defaultdict
+            pkg_atoms: Dict[str, Set[str]] = defaultdict(set)
+            pkg_extras: Dict[str, Set[str]] = defaultdict(set)
+
+            for name, specifier, extras, marker in filtered_reqs:
+                gentoo_name = pypi_to_gentoo(name)
                 atom = _format_gentoo_atom(name, specifier)
+                pkg_atoms[gentoo_name].add(atom)
                 if extras:
-                    # Add USE flag comment
-                    use_flags = ' '.join(extras)
+                    pkg_extras[gentoo_name].update(extras)
+
+            # Generate deduplicated atoms
+            version_conflicts = []
+            for gentoo_name in sorted(pkg_atoms.keys()):
+                atoms = pkg_atoms[gentoo_name]
+                extras = pkg_extras.get(gentoo_name, set())
+
+                if extras:
+                    use_flags = ' '.join(sorted(extras))
                     set_content_lines.append(f"# USE flags: {use_flags}")
-                set_content_lines.append(atom)
+
+                if len(atoms) == 1:
+                    # Single version - use as-is
+                    set_content_lines.append(atoms.pop())
+                else:
+                    # Multiple versions - use unversioned atom and report
+                    set_content_lines.append(f"dev-python/{gentoo_name}")
+                    version_conflicts.append((gentoo_name, sorted(atoms)))
 
             set_content = '\n'.join(set_content_lines) + '\n'
+
+            # Report version conflicts
+            if version_conflicts:
+                print(f"\nNote: {len(version_conflicts)} packages have different versions for different Python targets.")
+                print("Using unversioned atoms (portage will select appropriate version):")
+                for pkg, atoms in version_conflicts:
+                    print(f"  {pkg}: {', '.join(atoms)}")
+                print()
 
             if args.dry_run:
                 print(f"\n--- Would create {set_path} ---")
@@ -514,8 +970,8 @@ Then runs: emerge @{project}-dependencies
                     print("Try running with sudo")
                     return 1
 
-            # Add all requirements to the package list for USE flag handling
-            all_packages.extend(reqs)
+            # Add filtered requirements to the package list for USE flag handling
+            all_packages.extend(filtered_reqs)
 
     # Check if we have anything to install
     if not all_packages and not set_files_created and not args.dry_run:
@@ -523,9 +979,18 @@ Then runs: emerge @{project}-dependencies
         pip_parser.print_help()
         return 1
 
+    # Report skipped packages due to markers
+    if skipped_markers:
+        supported_versions = EbuildDataExtractor._get_supported_python_versions()
+        versions_str = ', '.join(supported_versions)
+        print(f"\nSkipped {len(skipped_markers)} packages (not applicable to Python {{{versions_str}}}):")
+        for name, marker in skipped_markers:
+            print(f"  {name}: {marker}")
+        print()
+
     # Collect USE flag requirements (extras)
     use_requirements: Dict[str, Set[str]] = {}
-    for name, specifier, extras in all_packages:
+    for name, specifier, extras, marker in all_packages:
         if extras:
             gentoo_name = pypi_to_gentoo(name)
             if gentoo_name not in use_requirements:
@@ -565,6 +1030,9 @@ Then runs: emerge @{project}-dependencies
             if Requirement is not None:
                 try:
                     req = Requirement(pkg_spec)
+                    # Check environment marker
+                    if not _evaluate_marker(req.marker):
+                        continue  # Already reported in skipped_markers
                     atom = _format_gentoo_atom(req.name, req.specifier)
                     emerge_cmd.append(atom)
                 except (InvalidRequirement, ValueError):

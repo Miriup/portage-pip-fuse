@@ -638,11 +638,18 @@ class PyPIMetadataExtractor:
         if not requires_python:
             return []
 
-        # Known Python 3 versions to check against (kept reasonably current)
-        # These are the versions that Gentoo's python-utils-r1.eclass supports
-        all_python_versions = [
-            '3.8', '3.9', '3.10', '3.11', '3.12', '3.13'
-        ]
+        # Get Python versions dynamically from _PYTHON_ALL_IMPLS
+        # This ensures we always check against current Gentoo-supported versions
+        valid_impls = EbuildDataExtractor._get_valid_python_impls()
+        all_python_versions = []
+        for impl in sorted(valid_impls):
+            if impl.startswith('python3_'):
+                minor = impl[8:]  # Remove 'python3_'
+                if minor.isdigit():  # Skip free-threading variants like '13t'
+                    all_python_versions.append(f'3.{minor}')
+        # Fallback if we couldn't get impls
+        if not all_python_versions:
+            all_python_versions = ['3.11', '3.12', '3.13', '3.14']
 
         if HAS_PACKAGING:
             try:
@@ -794,6 +801,7 @@ class PyPIMetadataExtractor:
         classifier_versions = self.extract_python_versions(metadata.get('classifiers', []))
 
         # Parse requires_python specifier if available
+        # Note: get_package_metadata stores this as 'python_requires'
         requires_python = metadata.get('python_requires', '')
         specifier_versions = self.parse_requires_python(requires_python) if requires_python else []
 
@@ -976,26 +984,18 @@ class EbuildDataExtractor:
             return self._compat_cache[cache_key]
         
         if not python_versions:
-            # Get system PYTHON_TARGETS as fallback
-            try:
-                import subprocess
-                result = subprocess.run(['portageq', 'envvar', 'PYTHON_TARGETS'], 
-                                      capture_output=True, text=True, check=True)
-                system_targets = result.stdout.strip().split()
-                # Convert to standard format (e.g., python3_11 -> 3.11)
-                fallback_versions = []
-                for target in system_targets:
-                    if target.startswith('python3_'):
-                        minor = target[8:]  # Remove 'python3_'
-                        fallback_versions.append(f'3.{minor}')
-                if fallback_versions:
-                    python_versions = fallback_versions
-                else:
-                    # Ultimate fallback
-                    python_versions = ['3.10', '3.11', '3.12']
-            except Exception:
-                # Ultimate fallback if portageq fails
-                python_versions = ['3.10', '3.11', '3.12']
+            # When compatibility is unknown, assume all current Python versions work
+            # PYTHON_COMPAT declares what the *package* supports, not what the *user* wants
+            valid_impls = self._get_valid_python_impls()
+            fallback_versions = []
+            for impl in sorted(valid_impls):
+                if impl.startswith('python3_'):
+                    minor = impl[8:]  # Remove 'python3_'
+                    if minor.endswith('t'):  # Skip free-threading variants
+                        continue
+                    fallback_versions.append(f'3.{minor}')
+            python_versions = fallback_versions if fallback_versions else ['3.11', '3.12', '3.13', '3.14']
+            logger.debug(f"No Python versions specified, using all valid: {python_versions}")
         
         # Get valid implementations from eclass
         valid_impls = self._get_valid_python_impls()
@@ -1027,46 +1027,32 @@ class EbuildDataExtractor:
                         logger.debug(f"Skipping {version_str} - not in _PYTHON_ALL_IMPLS")
         
         # If we have generic '3' AND specific versions, only use the specific versions
-        # If we have ONLY generic '3', use system targets that are valid
+        # If we have ONLY generic '3', use all valid implementations
         if has_generic and not specific_versions:
-            # Only generic "3" - use system targets that are in _PYTHON_ALL_IMPLS
-            try:
-                import subprocess
-                result = subprocess.run(['portageq', 'envvar', 'PYTHON_TARGETS'], 
-                                      capture_output=True, text=True, check=True)
-                system_targets = result.stdout.strip().split()
-                for target in system_targets:
-                    if (target.startswith('python3_') and 
-                        target in valid_impls and 
-                        target not in compat_versions):
-                        compat_versions.append(target)
-            except Exception:
-                # Fallback for generic "3" - use only valid current implementations
-                fallback_impls = [impl for impl in valid_impls if impl.startswith('python3_')]
-                compat_versions.extend(fallback_impls)
+            # Only generic "3" means "any Python 3" - use all valid implementations
+            # PYTHON_COMPAT declares what the *package* supports, not what the *user* wants
+            for impl in valid_impls:
+                if (impl.startswith('python3_') and
+                    not impl.endswith('t') and  # Skip free-threading variants
+                    impl not in compat_versions):
+                    compat_versions.append(impl)
+            logger.debug(f"Generic Python 3, using all valid impls: {compat_versions}")
         # If we have both generic '3' and specific versions, ignore the generic '3'
         
         # Remove duplicates and sort
         result = sorted(list(set(compat_versions)))
 
-        # If no valid versions found, fall back to system PYTHON_TARGETS
+        # If no valid versions found, fall back to all valid implementations
         # PyPI is a Python archive - packages without explicit requirements
         # should still work with current Python versions
         if not result:
-            try:
-                import subprocess
-                proc = subprocess.run(['portageq', 'envvar', 'PYTHON_TARGETS'],
-                                     capture_output=True, text=True, check=True)
-                system_targets = proc.stdout.strip().split()
-                for target in system_targets:
-                    if target.startswith('python3_') and target in valid_impls:
-                        result.append(target)
-                result = sorted(result)
-                logger.debug(f"No valid Python versions from metadata, using system targets: {result}")
-            except Exception:
-                # Ultimate fallback - use all valid Python 3 implementations
-                result = sorted([impl for impl in valid_impls if impl.startswith('python3_')])
-                logger.debug(f"Fallback to all valid impls: {result}")
+            # When compatibility is unknown, assume all current Python versions work
+            # PyPI packages without requires_python typically support all modern versions
+            # PYTHON_COMPAT declares what the *package* supports, not what the *user* wants
+            def standard_impls(impls):
+                return sorted([i for i in impls if i.startswith('python3_') and not i.endswith('t')])
+            result = standard_impls(valid_impls)
+            logger.debug(f"No valid Python versions from metadata, using all valid impls: {result}")
 
         # Cache the result
         self._compat_cache[cache_key] = result
@@ -1151,17 +1137,91 @@ class EbuildDataExtractor:
         else:
             # Unknown license - use all-rights-reserved per Gentoo policy
             return 'all-rights-reserved'
-    
+
+    @classmethod
+    def _get_supported_python_versions(cls) -> List[str]:
+        """
+        Get supported Python versions as version strings (e.g., "3.11", "3.12").
+
+        Returns:
+            List of Python version strings supported by the system
+
+        Examples:
+            >>> versions = EbuildDataExtractor._get_supported_python_versions()
+            >>> all(v.startswith('3.') for v in versions)
+            True
+        """
+        valid_impls = cls._get_valid_python_impls()
+        versions = []
+        for impl in sorted(valid_impls):
+            if impl.startswith('python3_'):
+                # Convert python3_11 -> 3.11, skip free-threading variants
+                suffix = impl[8:]
+                if suffix.endswith('t'):
+                    continue
+                try:
+                    versions.append(f'3.{suffix}')
+                except ValueError:
+                    continue
+        return versions
+
+    @staticmethod
+    def _evaluate_marker_for_python(marker, python_version: str) -> bool:
+        """
+        Evaluate a PEP 508 environment marker for a specific Python version.
+
+        Args:
+            marker: The marker object from packaging.requirements.Requirement
+            python_version: Python version string like "3.11"
+
+        Returns:
+            True if the marker evaluates to True for this Python version
+
+        Examples:
+            >>> extractor = EbuildDataExtractor()
+            >>> try:
+            ...     from pip._vendor.packaging.requirements import Requirement
+            ... except ImportError:
+            ...     from packaging.requirements import Requirement
+            >>> req = Requirement('numpy>=2; python_version >= "3.9"')
+            >>> extractor._evaluate_marker_for_python(req.marker, '3.11')
+            True
+            >>> extractor._evaluate_marker_for_python(req.marker, '3.8')
+            False
+        """
+        if marker is None:
+            return True
+
+        # Create environment dict for marker evaluation
+        # We only need python_version for our use case
+        env = {
+            'python_version': python_version,
+            'python_full_version': f'{python_version}.0',
+            'implementation_name': 'cpython',
+            'platform_system': 'Linux',
+            'sys_platform': 'linux',
+            'os_name': 'posix',
+        }
+
+        try:
+            return marker.evaluate(env)
+        except Exception as e:
+            logger.warning(f"Failed to evaluate marker {marker}: {e}")
+            return True  # Be permissive on errors
+
     def format_dependencies(self, dependencies: List[str]) -> List[str]:
         """
         Format Python dependencies for ebuild DEPEND/RDEPEND.
-        
+
+        Handles PEP 508 environment markers by evaluating them against supported
+        Python versions and generating conditional Gentoo dependencies when needed.
+
         Args:
-            dependencies: List of requirement strings
-            
+            dependencies: List of requirement strings (may include environment markers)
+
         Returns:
             List of formatted Gentoo dependencies
-            
+
         Examples:
             >>> extractor = EbuildDataExtractor()
             >>> deps = ['requests>=2.0.0', 'click>=7.0']
@@ -1172,39 +1232,102 @@ class EbuildDataExtractor:
             True
         """
         from portage_pip_fuse.name_translator import default_translator
-        
-        formatted_deps = []
-        
-        for dep_str in dependencies:
-            # Parse dependency using pip's requirement parsing
+
+        # Import Requirement class
+        try:
+            from pip._vendor.packaging.requirements import Requirement
+        except ImportError:
             try:
-                from pip._vendor.packaging.requirements import Requirement
+                from packaging.requirements import Requirement
+            except ImportError:
+                Requirement = None
+
+        # Get supported Python versions
+        supported_versions = self._get_supported_python_versions()
+        if not supported_versions:
+            supported_versions = ['3.11', '3.12', '3.13', '3.14']
+
+        # Group dependencies by package name to handle multiple markers for same package
+        # Structure: {package_name: [(specifiers, marker, gentoo_name), ...]}
+        package_deps: Dict[str, List[Tuple[Any, Any, str]]] = {}
+
+        for dep_str in dependencies:
+            if Requirement is None:
+                # Fallback: manual parsing without marker support
+                match = re.match(r'^([a-zA-Z0-9][a-zA-Z0-9._-]*[a-zA-Z0-9]|[a-zA-Z0-9])', dep_str.strip())
+                package_name = match.group(1) if match else dep_str.split()[0]
+                gentoo_name = default_translator.pypi_to_gentoo(package_name)
+                if package_name not in package_deps:
+                    package_deps[package_name] = []
+                package_deps[package_name].append((None, None, gentoo_name))
+                continue
+
+            try:
                 req = Requirement(dep_str.strip())
                 package_name = req.name
                 specifiers = req.specifier
-            except ImportError:
-                # Fallback to packaging library
-                try:
-                    from packaging.requirements import Requirement
-                    req = Requirement(dep_str.strip())
-                    package_name = req.name
-                    specifiers = req.specifier
-                except ImportError:
-                    # Last resort: manual parsing
-                    match = re.match(r'^([a-zA-Z0-9][a-zA-Z0-9._-]*[a-zA-Z0-9]|[a-zA-Z0-9])', dep_str.strip())
-                    package_name = match.group(1) if match else dep_str.split()[0]
-                    specifiers = None
-            
-            # Translate to Gentoo name and add version specifiers
-            gentoo_name = default_translator.pypi_to_gentoo(package_name)
-            if specifiers:
-                gentoo_dep = self._format_gentoo_dependency(gentoo_name, specifiers)
+                marker = req.marker
+                gentoo_name = default_translator.pypi_to_gentoo(package_name)
+
+                if package_name not in package_deps:
+                    package_deps[package_name] = []
+                package_deps[package_name].append((specifiers, marker, gentoo_name))
+            except Exception as e:
+                logger.warning(f"Failed to parse dependency '{dep_str}': {e}")
+                continue
+
+        # Process each package and generate appropriate Gentoo dependencies
+        formatted_deps = []
+
+        for package_name, dep_entries in package_deps.items():
+            gentoo_name = dep_entries[0][2]  # All entries have the same gentoo_name
+
+            # Build a map: python_version -> gentoo_dep_string
+            version_to_dep: Dict[str, str] = {}
+
+            for specifiers, marker, _ in dep_entries:
+                if specifiers:
+                    gentoo_dep = self._format_gentoo_dependency(gentoo_name, specifiers)
+                else:
+                    gentoo_dep = f"dev-python/{gentoo_name}"
+
+                # Determine which Python versions this applies to
+                for py_ver in supported_versions:
+                    if self._evaluate_marker_for_python(marker, py_ver):
+                        # This dependency applies to this Python version
+                        # If there's already a dep for this version, we have conflicting markers
+                        # Keep the first one (or we could try to merge, but that's complex)
+                        if py_ver not in version_to_dep:
+                            version_to_dep[py_ver] = gentoo_dep
+
+            if not version_to_dep:
+                # No Python versions matched - skip this dependency entirely
+                logger.debug(f"Dependency {package_name} has no matching Python versions, skipping")
+                continue
+
+            # Check if all versions have the same dependency
+            unique_deps = set(version_to_dep.values())
+
+            if len(unique_deps) == 1:
+                # All versions have the same dependency - simple case
+                formatted_deps.append(self._add_python_usedep(list(unique_deps)[0]))
             else:
-                gentoo_dep = f"dev-python/{gentoo_name}"
-            
-            # TODO: Add version constraints parsing
-            formatted_deps.append(gentoo_dep)
-        
+                # Different versions have different dependencies - use conditionals
+                # Group versions by their dependency to minimize output
+                dep_to_versions: Dict[str, List[str]] = {}
+                for py_ver, dep in version_to_dep.items():
+                    if dep not in dep_to_versions:
+                        dep_to_versions[dep] = []
+                    dep_to_versions[dep].append(py_ver)
+
+                for dep, versions in dep_to_versions.items():
+                    # Generate individual conditionals for each Python version
+                    # e.g., "3.11" -> "python_targets_python3_11? ( dep[${PYTHON_USEDEP}] )"
+                    dep_with_usedep = self._add_python_usedep(dep)
+                    for v in sorted(versions):
+                        use_flag = f"python_targets_python{v.replace('.', '_')}"
+                        formatted_deps.append(f"{use_flag}? ( {dep_with_usedep} )")
+
         return formatted_deps
         
     def extract_extras_as_use_flags(self, optional_dependencies: List[str]) -> Tuple[List[str], Dict[str, List[str]]]:
@@ -1278,7 +1401,10 @@ class EbuildDataExtractor:
                 gentoo_dep = self._format_gentoo_dependency(gentoo_name, specifiers)
             else:
                 gentoo_dep = f"dev-python/{gentoo_name}"
-            
+
+            # Add PYTHON_USEDEP to ensure deps are built for same Python targets
+            gentoo_dep = self._add_python_usedep(gentoo_dep)
+
             # Add to collections
             iuse_flags.add(use_flag)
             if use_flag not in optional_depend:
@@ -1286,6 +1412,41 @@ class EbuildDataExtractor:
             optional_depend[use_flag].append(gentoo_dep)
         
         return sorted(list(iuse_flags)), optional_depend
+
+    def _add_python_usedep(self, dep: str) -> str:
+        """
+        Add ${PYTHON_USEDEP} to a Gentoo dependency string.
+
+        Handles both simple atoms and || ( ) groups by adding the USEDEP
+        to each individual atom.
+
+        Args:
+            dep: Gentoo dependency string
+
+        Returns:
+            Dependency string with ${PYTHON_USEDEP} added to each atom
+
+        Examples:
+            >>> extractor = EbuildDataExtractor()
+            >>> extractor._add_python_usedep('>=dev-python/requests-2.0')
+            '>=dev-python/requests-2.0[${PYTHON_USEDEP}]'
+            >>> extractor._add_python_usedep('|| ( =dev-python/foo-1.0 =dev-python/foo-1.0.0 )')
+            '|| ( =dev-python/foo-1.0[${PYTHON_USEDEP}] =dev-python/foo-1.0.0[${PYTHON_USEDEP}] )'
+            >>> extractor._add_python_usedep('dev-python/simple')
+            'dev-python/simple[${PYTHON_USEDEP}]'
+        """
+        usedep = '[${PYTHON_USEDEP}]'
+
+        # Handle || ( ) groups - add USEDEP to each atom inside
+        if dep.startswith('|| ('):
+            # Extract atoms from inside || ( ... )
+            inner = dep[4:-1].strip()  # Remove "|| (" and ")"
+            atoms = inner.split()
+            atoms_with_usedep = [f"{atom}{usedep}" for atom in atoms]
+            return f"|| ( {' '.join(atoms_with_usedep)} )"
+
+        # Simple atom - just append USEDEP
+        return f"{dep}{usedep}"
 
     def _translate_pypi_version(self, pypi_version: str) -> str:
         """
@@ -1324,12 +1485,14 @@ class EbuildDataExtractor:
 
         # Handle pre-release markers (must check longer patterns first)
         # alpha/a followed by a number
+        # Use negative lookbehind to avoid matching 'a' in already-translated '_alpha'
         version = re.sub(r'\.?alpha(\d+)', r'_alpha\1', version)
-        version = re.sub(r'\.?a(\d+)', r'_alpha\1', version)
+        version = re.sub(r'(?<![a-z])\.?a(\d+)', r'_alpha\1', version)
 
         # beta/b followed by a number
+        # Use negative lookbehind to avoid matching 'b' in already-translated '_beta'
         version = re.sub(r'\.?beta(\d+)', r'_beta\1', version)
-        version = re.sub(r'\.?b(\d+)', r'_beta\1', version)
+        version = re.sub(r'(?<![a-z])\.?b(\d+)', r'_beta\1', version)
 
         # rc/c followed by a number (release candidate)
         # Must check 'rc' first before 'c' to avoid partial match
@@ -1344,6 +1507,78 @@ class EbuildDataExtractor:
         version = re.sub(r'\.dev(\d+)', r'_pre\1', version)
 
         return version
+
+    def _normalize_version_shortest(self, version: str) -> str:
+        """
+        Normalize version to shortest form by stripping trailing .0 segments.
+
+        Examples:
+            >>> extractor = EbuildDataExtractor()
+            >>> extractor._normalize_version_shortest('1.33.0')
+            '1.33'
+            >>> extractor._normalize_version_shortest('2.0.0')
+            '2.0'
+            >>> extractor._normalize_version_shortest('1.33')
+            '1.33'
+        """
+        # Don't normalize versions with suffixes
+        if '_' in version:
+            return version
+        while version.endswith('.0') and version.count('.') > 1:
+            version = version[:-2]
+        return version
+
+    def _normalize_version_longest(self, version: str) -> str:
+        """
+        Normalize version to longest form by adding trailing .0 segment.
+
+        Examples:
+            >>> extractor = EbuildDataExtractor()
+            >>> extractor._normalize_version_longest('1.33')
+            '1.33.0'
+            >>> extractor._normalize_version_longest('1.33.0')
+            '1.33.0'
+        """
+        # Don't normalize versions with suffixes
+        if '_' in version:
+            return version
+        if not version.endswith('.0') or version.count('.') < 2:
+            return version + '.0'
+        return version
+
+    def _get_pep440_equivalent_version(self, version: str) -> Optional[str]:
+        """
+        Get PEP 440 equivalent version with/without trailing .0.
+
+        PEP 440 considers 1.33 and 1.33.0 equivalent, but Gentoo doesn't.
+        This returns the alternate form so we can match either.
+
+        Args:
+            version: Version string (already translated to Gentoo format)
+
+        Returns:
+            Alternate version form, or None if not applicable
+
+        Examples:
+            >>> extractor = EbuildDataExtractor()
+            >>> extractor._get_pep440_equivalent_version('1.33')
+            '1.33.0'
+            >>> extractor._get_pep440_equivalent_version('1.33.0')
+            '1.33'
+            >>> extractor._get_pep440_equivalent_version('2.0.0')
+            '2.0'
+            >>> extractor._get_pep440_equivalent_version('1.0_alpha1')
+        """
+        # Don't apply to versions with suffixes (alpha, beta, rc, p, pre)
+        if '_' in version:
+            return None
+
+        if version.endswith('.0') and version.count('.') > 1:
+            # Has trailing .0 - return without it (1.33.0 -> 1.33)
+            return version[:-2]
+        else:
+            # No trailing .0 - return with it (1.33 -> 1.33.0)
+            return version + '.0'
 
     def _format_gentoo_dependency(self, gentoo_name: str, specifiers) -> str:
         """
@@ -1396,15 +1631,32 @@ class EbuildDataExtractor:
                 # Handle wildcard versions: PyPI ==23.* -> Gentoo =pkg-23*
                 if version.endswith('.*'):
                     version = version[:-2] + '*'  # Remove .* and add *
-                dep_parts.append(f"=dev-python/{gentoo_name}-{version}")
+                    dep_parts.append(f"=dev-python/{gentoo_name}-{version}")
+                else:
+                    # PEP 440 considers 1.33 == 1.33.0, but Gentoo doesn't
+                    # Generate || ( =pkg-1.33 =pkg-1.33.0 ) to match either
+                    alt_version = self._get_pep440_equivalent_version(version)
+                    if alt_version:
+                        dep_parts.append(f"|| ( =dev-python/{gentoo_name}-{version} =dev-python/{gentoo_name}-{alt_version} )")
+                    else:
+                        dep_parts.append(f"=dev-python/{gentoo_name}-{version}")
             elif operator == '>=':
-                dep_parts.append(f">=dev-python/{gentoo_name}-{version}")
+                # Normalize to shortest form so >=1.33.0 matches version 1.33
+                # (In Gentoo 1.33 < 1.33.0, but in PEP 440 they're equal)
+                norm_version = self._normalize_version_shortest(version)
+                dep_parts.append(f">=dev-python/{gentoo_name}-{norm_version}")
             elif operator == '>':
+                # Keep original - >1.33.0 correctly excludes both 1.33 and 1.33.0 in Gentoo
                 dep_parts.append(f">dev-python/{gentoo_name}-{version}")
             elif operator == '<=':
-                dep_parts.append(f"<=dev-python/{gentoo_name}-{version}")
+                # Use longest form so <=1.33 also includes 1.33.0
+                norm_version = self._normalize_version_longest(version)
+                dep_parts.append(f"<=dev-python/{gentoo_name}-{norm_version}")
             elif operator == '<':
-                dep_parts.append(f"<dev-python/{gentoo_name}-{version}")
+                # Normalize to shortest form so <1.33.0 excludes 1.33 too
+                # (In PEP 440, 1.33 == 1.33.0, so <1.33.0 should exclude 1.33)
+                norm_version = self._normalize_version_shortest(version)
+                dep_parts.append(f"<dev-python/{gentoo_name}-{norm_version}")
             elif operator == '!=':
                 # Handle wildcard versions: PyPI !=9.2.* -> Gentoo !=pkg-9.2*
                 # Note: Gentoo uses != for versioned blocks, ! is only for unversioned
@@ -1502,10 +1754,8 @@ class EbuildDataExtractor:
                 package_info.get('python_versions', [])
             ),
             
-            # Dependencies
-            'DEPEND': self.format_dependencies(
-                package_info.get('runtime_dependencies', [])
-            ),
+            # Dependencies - pure Python packages only need runtime deps
+            'DEPEND': [],  # No build-time deps for pure Python
             'RDEPEND': self.format_dependencies(
                 package_info.get('runtime_dependencies', [])
             ),
