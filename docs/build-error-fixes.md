@@ -225,6 +225,52 @@ To export patches for sharing:
 cat /var/db/repos/pypi/.sys/python-compat-patch/dev-python/psycopg/2.9.5.patch
 ```
 
+## Masking Incompatible Versions
+
+Sometimes the best fix is to mask old package versions and use a newer release that has the fix upstream. This is especially useful for:
+
+- Build tool incompatibilities (e.g., Cython 3.x breaking older packages)
+- Packages with known security vulnerabilities
+- Versions that predate Python version support
+
+### Example: gevent Cython 3.x Incompatibility
+
+#### Error Output
+```
+src/gevent/libev/corecext.pyx:69:26: undeclared name not builtin: long
+Cython.Compiler.Errors.CompileError: src/gevent/libev/corecext.pyx
+ * ERROR: dev-python/gevent-24.2.1::portage-pip-fuse failed (compile phase):
+```
+
+#### Analysis
+
+- **Package**: gevent-24.2.1
+- **Error type**: Cython 3.x incompatibility
+- **Cause**: Cython 3 rejects Python 2 syntax (`long`) even in unreachable code branches. gevent 24.10.1+ includes Cython 3 compatibility fixes.
+
+#### Fix
+
+Mask old versions in `/etc/portage/package.mask/gevent`:
+```
+# Cython 3.x incompatibility - use >=24.10.1
+<dev-python/gevent-24.10.1
+```
+
+Then re-run:
+```bash
+emerge dev-python/gevent
+```
+
+### When to Mask vs Patch
+
+| Situation | Recommended Approach |
+|-----------|---------------------|
+| Newer version has the fix | Mask old versions |
+| No fixed version available | Use `.sys/` patches |
+| Need specific old version | Use `.sys/` patches |
+| Build tool incompatibility | Mask old versions |
+| Python version incompatibility | Either approach works |
+
 ## Common Python API Changes by Version
 
 | Python Version | Common Breaking Changes |
