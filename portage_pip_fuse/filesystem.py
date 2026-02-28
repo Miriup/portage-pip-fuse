@@ -1264,27 +1264,33 @@ cache-formats = md5-dict
 
             elif parsed['type'] == 'sys_deps_package':
                 # /.sys/dependencies/dev-python/requests - show versions
+                # IMPORTANT: Use cached versions only to prevent blocking
                 if self.patch_store is not None:
                     gentoo_name = parsed['package']
                     pypi_name = self._gentoo_to_pypi(gentoo_name)
                     if pypi_name:
-                        versions = self._get_package_versions(pypi_name)
-                        entries.extend(versions)
+                        # Check if versions are cached
+                        cache_key = f"versions_{pypi_name}"
+                        if cache_key in self._metadata_cache:
+                            versions, _ = self._metadata_cache[cache_key]
+                            entries.extend(versions)
+                        # else: versions not cached, return empty (user can cd directly)
                         entries.append('_all')  # Always show _all for global patches
 
             elif parsed['type'] == 'sys_deps_version':
                 # /.sys/dependencies/dev-python/requests/2.31.0 - show dependencies
+                # IMPORTANT: Use cached data only to prevent blocking
                 if self.patch_store is not None:
                     gentoo_name = parsed['package']
                     version = parsed['version']
                     category = parsed['category']
-                    pypi_name = self._gentoo_to_pypi(gentoo_name)
-                    if pypi_name:
-                        # Get original dependencies and apply patches
-                        deps = self._get_package_deps_for_sys(category, gentoo_name, pypi_name, version)
-                        # Encode deps for use as filenames (they contain '/')
-                        encoded_deps = [self._encode_dep_filename(dep) for dep in deps]
-                        entries.extend(encoded_deps)
+                    # Show only patched deps (from local patch store) - no network calls
+                    # Original deps would require fetching package info which can block
+                    patches = self.patch_store.get_patches(category, gentoo_name, version)
+                    for patch in patches:
+                        if patch.action == 'add' and patch.dependency:
+                            entries.append(self._encode_dep_filename(patch.dependency))
+                    # Note: Full dep listing requires 'cat' on a specific dep file
 
             elif parsed['type'] == 'sys_patch':
                 # /.sys/dependencies-patch - show categories
