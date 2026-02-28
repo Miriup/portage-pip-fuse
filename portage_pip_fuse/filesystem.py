@@ -993,28 +993,38 @@ cache-formats = md5-dict
                 attrs['st_mtime'] = upload_time
                 attrs['st_ctime'] = upload_time
             
-            # Get actual size by generating content
+            # Get actual size by generating content and caching it
             # This ensures vim and other tools see the correct file size
+            # IMPORTANT: We must cache the content here so read() returns the same
+            # content that we used to compute the size. Otherwise, if content
+            # generation is non-deterministic (e.g., PYTHON_COMPAT changes),
+            # the file will appear truncated.
             try:
-                if parsed['type'] == 'ebuild':
+                # First check if content is already cached
+                cached_content = self._get_cached_content(path)
+                if cached_content is not None:
+                    attrs['st_size'] = len(cached_content)
+                elif parsed['type'] == 'ebuild':
                     # Extract category from parsed path
                     category = parsed.get('category', 'dev-python')
                     content = self._generate_ebuild(category, parsed['package'], parsed['version'])
                     if content is None:
                         # Ebuild can't be generated (e.g., empty PYTHON_COMPAT)
                         raise FuseOSError(errno.ENOENT)
-                    attrs['st_size'] = len(content.encode('utf-8'))
+                    content_bytes = content.encode('utf-8')
+                    attrs['st_size'] = len(content_bytes)
+                    # Cache so read() returns the same content
+                    self._cache_content(path, content_bytes)
                 elif parsed['type'] == 'package_metadata':
                     content = self._generate_metadata_xml(pypi_name)
-                    attrs['st_size'] = len(content.encode('utf-8'))
+                    content_bytes = content.encode('utf-8')
+                    attrs['st_size'] = len(content_bytes)
+                    self._cache_content(path, content_bytes)
                 elif parsed['type'] == 'manifest':
                     content = self._generate_manifest(parsed['category'], parsed['package'])
-                    attrs['st_size'] = len(content.encode('utf-8'))
-                else:
-                    # Try to get cached content as fallback
-                    cached = self._get_cached_content(path)
-                    if cached:
-                        attrs['st_size'] = len(cached)
+                    content_bytes = content.encode('utf-8')
+                    attrs['st_size'] = len(content_bytes)
+                    self._cache_content(path, content_bytes)
             except FuseOSError:
                 # Re-raise FUSE errors (including our ENOENT for invalid ebuilds)
                 raise
@@ -1658,7 +1668,17 @@ cache-formats = md5-dict
                     deps_str = ' '.join(deps)
                     ebuild_lines.append(f"\t{use_flag}? ( {deps_str} )")
             ebuild_lines.append(f"\"")
-            
+
+        # Add python_compile_pre to clean bundled autoconf caches between Python impls
+        # This fixes packages like gevent that bundle c-ares/libev with config.cache
+        ebuild_lines.extend([
+            f"",
+            f"python_compile_pre() {{",
+            f"\t# Clean autoconf caches from bundled deps to avoid conflicts between Python impls",
+            f"\tfind \"${{S}}\" -name config.cache -delete 2>/dev/null || true",
+            f"}}",
+        ])
+
         return '\n'.join(ebuild_lines) + '\n'
         
     def _generate_package_metadata(self, category: str, package: str) -> Optional[str]:
