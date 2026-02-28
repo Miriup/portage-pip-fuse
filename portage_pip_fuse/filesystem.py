@@ -25,6 +25,7 @@ from fuse import FUSE, FuseOSError, Operations
 
 from .constants import REPO_NAME, DEFAULT_PATCH_FILE
 from .dependency_patch import DependencyPatchStore
+from .python_compat_patch import PythonCompatPatchStore
 from .interrupt import InterruptChecker, check_interrupt
 from .prefetcher import create_prefetched_translator
 from .pip_metadata import PyPIMetadataExtractor, EbuildDataExtractor
@@ -128,6 +129,16 @@ class PortagePipFS(Operations):
             self.patch_store = None
             logger.info("Dependency patching disabled")
 
+        # Initialize PYTHON_COMPAT patch store (uses same file as dependency patches)
+        if not no_patches:
+            if patch_file:
+                self.compat_patch_store = PythonCompatPatchStore(patch_file)
+            else:
+                self.compat_patch_store = PythonCompatPatchStore(str(DEFAULT_PATCH_FILE))
+            logger.info(f"PYTHON_COMPAT patching enabled, using {self.compat_patch_store.storage_path}")
+        else:
+            self.compat_patch_store = None
+
         # Static overlay structure
         self.static_dirs = {
             "/",
@@ -140,7 +151,12 @@ class PortagePipFS(Operations):
             "/.sys/dependencies",
             "/.sys/dependencies/dev-python",
             "/.sys/dependencies-patch",
-            "/.sys/dependencies-patch/dev-python"
+            "/.sys/dependencies-patch/dev-python",
+            # .sys virtual filesystem for PYTHON_COMPAT patching
+            "/.sys/python-compat",
+            "/.sys/python-compat/dev-python",
+            "/.sys/python-compat-patch",
+            "/.sys/python-compat-patch/dev-python"
         }
         
         # Static files
@@ -399,6 +415,52 @@ cache-formats = md5-dict
                     version = filename[:-6]  # Remove .patch
                     return {
                         'type': 'sys_patch_file',
+                        'category': parts[2],
+                        'package': parts[3],
+                        'version': version,
+                        'filename': filename
+                    }
+
+        elif parts[1] == 'python-compat':
+            if len(parts) == 2:
+                # /.sys/python-compat
+                return {'type': 'sys_compat'}
+            elif len(parts) == 3:
+                # /.sys/python-compat/dev-python
+                return {'type': 'sys_compat_category', 'category': parts[2]}
+            elif len(parts) == 4:
+                # /.sys/python-compat/dev-python/pillow
+                return {'type': 'sys_compat_package', 'category': parts[2], 'package': parts[3]}
+            elif len(parts) == 5:
+                # /.sys/python-compat/dev-python/pillow/9.4.0
+                return {'type': 'sys_compat_version', 'category': parts[2], 'package': parts[3], 'version': parts[4]}
+            elif len(parts) == 6:
+                # /.sys/python-compat/dev-python/pillow/9.4.0/python3_13
+                return {
+                    'type': 'sys_compat_impl',
+                    'category': parts[2],
+                    'package': parts[3],
+                    'version': parts[4],
+                    'impl': parts[5]
+                }
+
+        elif parts[1] == 'python-compat-patch':
+            if len(parts) == 2:
+                # /.sys/python-compat-patch
+                return {'type': 'sys_compat_patch'}
+            elif len(parts) == 3:
+                # /.sys/python-compat-patch/dev-python
+                return {'type': 'sys_compat_patch_category', 'category': parts[2]}
+            elif len(parts) == 4:
+                # /.sys/python-compat-patch/dev-python/pillow
+                return {'type': 'sys_compat_patch_package', 'category': parts[2], 'package': parts[3]}
+            elif len(parts) == 5:
+                # /.sys/python-compat-patch/dev-python/pillow/9.4.0.patch
+                filename = parts[4]
+                if filename.endswith('.patch'):
+                    version = filename[:-6]  # Remove .patch
+                    return {
+                        'type': 'sys_compat_patch_file',
                         'category': parts[2],
                         'package': parts[3],
                         'version': version,
@@ -1007,6 +1069,51 @@ cache-formats = md5-dict
                 'st_nlink': 1,
                 'st_size': len(content.encode('utf-8')),
             })
+        # Handle .sys/python-compat/ virtual filesystem paths
+        elif parsed['type'] in ('sys_compat', 'sys_compat_category',
+                                'sys_compat_patch', 'sys_compat_patch_category'):
+            # Static .sys/python-compat directories
+            attrs.update({
+                'st_mode': stat.S_IFDIR | 0o755,
+                'st_nlink': 2,
+                'st_size': 4096,
+            })
+        elif parsed['type'] in ('sys_compat_package', 'sys_compat_version', 'sys_compat_patch_package'):
+            # Dynamic .sys/python-compat directories - verify package exists
+            if self.compat_patch_store is None:
+                raise FuseOSError(errno.ENOENT)
+            gentoo_name = parsed['package']
+            pypi_name = self._gentoo_to_pypi(gentoo_name)
+            if not pypi_name or not self._package_exists(pypi_name):
+                raise FuseOSError(errno.ENOENT)
+            attrs.update({
+                'st_mode': stat.S_IFDIR | 0o755,
+                'st_nlink': 2,
+                'st_size': 4096,
+            })
+        elif parsed['type'] == 'sys_compat_impl':
+            # Implementation file in .sys/python-compat/.../version/
+            if self.compat_patch_store is None:
+                raise FuseOSError(errno.ENOENT)
+            impl_name = parsed['impl']
+            attrs.update({
+                'st_mode': stat.S_IFREG | 0o644,
+                'st_nlink': 1,
+                'st_size': len(impl_name.encode('utf-8')),
+            })
+        elif parsed['type'] == 'sys_compat_patch_file':
+            # Patch file in .sys/python-compat-patch/
+            if self.compat_patch_store is None:
+                raise FuseOSError(errno.ENOENT)
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+            content = self.compat_patch_store.generate_patch_file(category, package, version)
+            attrs.update({
+                'st_mode': stat.S_IFREG | 0o644,
+                'st_nlink': 1,
+                'st_size': len(content.encode('utf-8')),
+            })
         elif parsed['type'] == 'invalid':
             # Invalid path - return ENOENT
             raise FuseOSError(errno.ENOENT)
@@ -1119,9 +1226,11 @@ cache-formats = md5-dict
 
             # Handle .sys/ virtual filesystem directories
             elif parsed['type'] == 'sys_root':
-                # /.sys - show dependencies and dependencies-patch
+                # /.sys - show all virtual filesystem sections
                 if self.patch_store is not None:
                     entries.extend(['dependencies', 'dependencies-patch'])
+                if self.compat_patch_store is not None:
+                    entries.extend(['python-compat', 'python-compat-patch'])
 
             elif parsed['type'] == 'sys_deps':
                 # /.sys/dependencies - show categories
@@ -1188,6 +1297,70 @@ cache-formats = md5-dict
                     for ver in versions:
                         entries.append(f"{ver}.patch")
 
+            # Handle .sys/python-compat/ directories
+            elif parsed['type'] == 'sys_compat':
+                # /.sys/python-compat - show categories
+                if self.compat_patch_store is not None:
+                    entries.append('dev-python')
+
+            elif parsed['type'] == 'sys_compat_category':
+                # /.sys/python-compat/dev-python - show packages with patches or cached packages
+                if self.compat_patch_store is not None:
+                    # Show packages that have patches
+                    for cat, pkg, ver in self.compat_patch_store.list_patched_packages():
+                        if cat == parsed['category'] and pkg not in entries:
+                            entries.append(pkg)
+                    # Also show all cached packages for convenience
+                    cache_key = 'dev-python'
+                    if cache_key in self._category_cache:
+                        cached_packages, _ = self._category_cache[cache_key]
+                        for pkg in cached_packages:
+                            if pkg not in entries:
+                                entries.append(pkg)
+
+            elif parsed['type'] == 'sys_compat_package':
+                # /.sys/python-compat/dev-python/pillow - show versions
+                if self.compat_patch_store is not None:
+                    gentoo_name = parsed['package']
+                    pypi_name = self._gentoo_to_pypi(gentoo_name)
+                    if pypi_name:
+                        versions = self._get_package_versions(pypi_name)
+                        entries.extend(versions)
+                        entries.append('_all')  # Always show _all for global patches
+
+            elif parsed['type'] == 'sys_compat_version':
+                # /.sys/python-compat/dev-python/pillow/9.4.0 - show Python implementations
+                if self.compat_patch_store is not None:
+                    gentoo_name = parsed['package']
+                    version = parsed['version']
+                    category = parsed['category']
+                    pypi_name = self._gentoo_to_pypi(gentoo_name)
+                    if pypi_name:
+                        # Get current PYTHON_COMPAT (original + patches applied)
+                        impls = self._get_package_python_compat_for_sys(category, gentoo_name, pypi_name, version)
+                        entries.extend(impls)
+
+            elif parsed['type'] == 'sys_compat_patch':
+                # /.sys/python-compat-patch - show categories
+                if self.compat_patch_store is not None:
+                    entries.append('dev-python')
+
+            elif parsed['type'] == 'sys_compat_patch_category':
+                # /.sys/python-compat-patch/dev-python - show packages with patches
+                if self.compat_patch_store is not None:
+                    for cat, pkg, ver in self.compat_patch_store.list_patched_packages():
+                        if cat == parsed['category'] and pkg not in entries:
+                            entries.append(pkg)
+
+            elif parsed['type'] == 'sys_compat_patch_package':
+                # /.sys/python-compat-patch/dev-python/pillow - show version.patch files
+                if self.compat_patch_store is not None:
+                    category = parsed['category']
+                    package = parsed['package']
+                    versions = self.compat_patch_store.get_package_versions_with_patches(category, package)
+                    for ver in versions:
+                        entries.append(f"{ver}.patch")
+
         except InterruptedError:
             logger.info(f"readdir interrupted for {path}")
             # Return minimal result on interrupt
@@ -1227,6 +1400,22 @@ cache-formats = md5-dict
             package = parsed['package']
             version = parsed['version']
             content = self.patch_store.generate_patch_file(category, package, version).encode('utf-8')
+            return content[offset:offset + length]
+
+        # Handle .sys/python-compat/ file reads
+        elif parsed['type'] == 'sys_compat_impl':
+            # Read an implementation file - just return the impl name
+            content = parsed['impl'].encode('utf-8')
+            return content[offset:offset + length]
+
+        elif parsed['type'] == 'sys_compat_patch_file':
+            # Read a PYTHON_COMPAT patch file
+            if self.compat_patch_store is None:
+                raise FuseOSError(errno.ENOENT)
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+            content = self.compat_patch_store.generate_patch_file(category, package, version).encode('utf-8')
             return content[offset:offset + length]
 
         try:
@@ -1269,7 +1458,8 @@ cache-formats = md5-dict
                     logger.debug(f"Cannot translate package name: {gentoo_name}")
                     raise FuseOSError(errno.ENOENT)
             return 0
-        elif parsed['type'] in ['sys_deps_dep', 'sys_patch_file']:
+        elif parsed['type'] in ['sys_deps_dep', 'sys_patch_file',
+                                  'sys_compat_impl', 'sys_compat_patch_file']:
             # Allow opening .sys files
             return 0
 
@@ -1378,8 +1568,15 @@ cache-formats = md5-dict
                 logger.error(f"Failed to prepare ebuild data for {package}-{version}")
                 return None
 
-            # Check if PYTHON_COMPAT would be empty - if so, hide this ebuild
+            # Apply PYTHON_COMPAT patches if enabled
             python_compat = ebuild_data.get('PYTHON_COMPAT', [])
+            if self.compat_patch_store is not None:
+                python_compat = self.compat_patch_store.apply_patches(
+                    category, package, version, python_compat
+                )
+                ebuild_data['PYTHON_COMPAT'] = python_compat
+
+            # Check if PYTHON_COMPAT would be empty - if so, hide this ebuild
             if not python_compat:
                 logger.debug(f"Hiding {package}-{version}: no valid PYTHON_COMPAT")
                 return None
@@ -1415,13 +1612,14 @@ cache-formats = md5-dict
             f"",
             f"EAPI=8",
             f"",
-            f"DISTUTILS_USE_PEP517=standalone",
+            f"DISTUTILS_USE_PEP517=setuptools",
             f"PYTHON_COMPAT=( {' '.join(data.get('PYTHON_COMPAT', ['python3_11', 'python3_12', 'python3_13']))} )",
-            f"",
-            f"inherit distutils-r1 pypi",
-            f"",
+            f"# PYPI_* variables must be set before inherit",
+            f"PYPI_NO_NORMALIZE=1",
             f"PYPI_PN=\"{data.get('PYPI_PN', data.get('PN', ''))}\"",
             f"PYPI_PV=\"{data.get('PYPI_PV', data.get('PV', ''))}\"",
+            f"",
+            f"inherit distutils-r1 pypi",
             f"",
             f"DESCRIPTION=\"{self._escape_double_quotes(data.get('DESCRIPTION', 'Python package from PyPI'))}\"",
             f"HOMEPAGE=\"{data.get('HOMEPAGE', 'https://pypi.org/project/' + data.get('PN', ''))}\"",
@@ -1544,7 +1742,14 @@ cache-formats = md5-dict
             if self.patch_store.save():
                 logger.info(f"Patches saved to {self.patch_store.storage_path}")
             else:
-                logger.error("Failed to save patches!")
+                logger.error("Failed to save dependency patches!")
+
+        if self.compat_patch_store is not None and self.compat_patch_store.is_dirty:
+            logger.info("Saving PYTHON_COMPAT patches...")
+            if self.compat_patch_store.save():
+                logger.info(f"PYTHON_COMPAT patches saved to {self.compat_patch_store.storage_path}")
+            else:
+                logger.error("Failed to save PYTHON_COMPAT patches!")
 
         # Close the extractor properly
         if hasattr(self.pypi_extractor, 'close'):
@@ -1599,10 +1804,61 @@ cache-formats = md5-dict
             logger.debug(f"Error getting deps for {gentoo_name}-{version}: {e}")
             return []
 
+    def _get_package_python_compat_for_sys(self, category: str, gentoo_name: str,
+                                            pypi_name: str, version: str) -> List[str]:
+        """
+        Get PYTHON_COMPAT for display in .sys/python-compat filesystem.
+
+        Returns original PYTHON_COMPAT with patches applied.
+        """
+        if version == '_all':
+            # For _all, return empty list (patches apply to all versions)
+            return []
+
+        try:
+            # Find the PyPI version
+            json_data = self._get_cached_package_json(pypi_name)
+            if not json_data or 'releases' not in json_data:
+                return []
+
+            pypi_version = None
+            for pypi_ver in json_data['releases']:
+                if self._translate_version(pypi_ver) == version:
+                    pypi_version = pypi_ver
+                    break
+
+            if not pypi_version:
+                return []
+
+            # Get package metadata
+            version_metadata = self.pypi_extractor.get_complete_package_info(pypi_name, pypi_version)
+            if not version_metadata:
+                return []
+
+            # Prepare ebuild data to get formatted PYTHON_COMPAT
+            ebuild_data = self.ebuild_extractor.prepare_ebuild_data(version_metadata)
+            if not ebuild_data:
+                return []
+
+            # Get PYTHON_COMPAT
+            python_compat = ebuild_data.get('PYTHON_COMPAT', [])
+
+            # Apply patches
+            if self.compat_patch_store is not None:
+                python_compat = self.compat_patch_store.apply_patches(
+                    category, gentoo_name, version, python_compat
+                )
+
+            return python_compat
+
+        except Exception as e:
+            logger.debug(f"Error getting PYTHON_COMPAT for {gentoo_name}-{version}: {e}")
+            return []
+
     # FUSE write operations for .sys/ filesystem
 
     def create(self, path, mode, fi=None):
-        """Create a new file (used for adding dependencies via touch)."""
+        """Create a new file (used for adding dependencies/impls via touch)."""
         parsed = self._parse_path(path)
 
         if parsed['type'] == 'sys_deps_dep':
@@ -1619,10 +1875,24 @@ cache-formats = md5-dict
             logger.info(f"Added dependency via touch: {new_dep} to {category}/{package}/{version}")
             return 0
 
+        if parsed['type'] == 'sys_compat_impl':
+            # touch /.sys/python-compat/dev-python/pkg/ver/python3_13
+            if self.compat_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+            impl = parsed['impl']
+
+            self.compat_patch_store.add_impl(category, package, version, impl)
+            logger.info(f"Added impl via touch: {impl} to {category}/{package}/{version}")
+            return 0
+
         raise FuseOSError(errno.EROFS)
 
     def unlink(self, path):
-        """Remove a file (used for removing dependencies via rm)."""
+        """Remove a file (used for removing dependencies/impls via rm)."""
         parsed = self._parse_path(path)
 
         if parsed['type'] == 'sys_deps_dep':
@@ -1637,6 +1907,20 @@ cache-formats = md5-dict
 
             self.patch_store.remove_dependency(category, package, version, old_dep)
             logger.info(f"Removed dependency via rm: {old_dep} from {category}/{package}/{version}")
+            return
+
+        if parsed['type'] == 'sys_compat_impl':
+            # rm /.sys/python-compat/dev-python/pkg/ver/python3_14
+            if self.compat_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+            impl = parsed['impl']
+
+            self.compat_patch_store.remove_impl(category, package, version, impl)
+            logger.info(f"Removed impl via rm: {impl} from {category}/{package}/{version}")
             return
 
         raise FuseOSError(errno.EROFS)
@@ -1688,7 +1972,26 @@ cache-formats = md5-dict
             # Clear existing patches and import new ones
             self.patch_store.clear_patches(category, package, version)
             count = self.patch_store.parse_patch_file(content, category, package, version)
-            logger.info(f"Imported {count} patches via write to {path}")
+            logger.info(f"Imported {count} dependency patches via write to {path}")
+
+            return len(data)
+
+        if parsed['type'] == 'sys_compat_patch_file':
+            # echo "..." > /.sys/python-compat-patch/dev-python/pkg/ver.patch
+            if self.compat_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+
+            # Decode and parse patch content
+            content = data.decode('utf-8', errors='replace')
+
+            # Clear existing patches and import new ones
+            self.compat_patch_store.clear_patches(category, package, version)
+            count = self.compat_patch_store.parse_patch_file(content, category, package, version)
+            logger.info(f"Imported {count} PYTHON_COMPAT patches via write to {path}")
 
             return len(data)
 
@@ -1699,7 +2002,7 @@ cache-formats = md5-dict
         parsed = self._parse_path(path)
 
         if parsed['type'] == 'sys_patch_file':
-            # Support truncate for patch files
+            # Support truncate for dependency patch files
             if self.patch_store is None:
                 raise FuseOSError(errno.EROFS)
 
@@ -1709,6 +2012,19 @@ cache-formats = md5-dict
                 package = parsed['package']
                 version = parsed['version']
                 self.patch_store.clear_patches(category, package, version)
+            return
+
+        if parsed['type'] == 'sys_compat_patch_file':
+            # Support truncate for PYTHON_COMPAT patch files
+            if self.compat_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+
+            if length == 0:
+                # truncate to 0 = clear all patches
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                self.compat_patch_store.clear_patches(category, package, version)
             return
 
         raise FuseOSError(errno.EROFS)
