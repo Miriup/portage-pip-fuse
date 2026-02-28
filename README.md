@@ -251,7 +251,7 @@ The metadata cache is stored in the first writable location:
    - Package metadata from PyPI/SQLite
    - PYTHON_COMPAT from package classifiers
    - Dependencies mapped to Gentoo atoms
-   - Manifest with SHA256/BLAKE2B checksums
+   - Manifest with SHA256/MD5 checksums (PyPI doesn't provide BLAKE2B-512)
 
 4. **Name Translation**: Automatically converts between naming conventions:
    - PyPI: `Pillow`, `scikit-learn`, `ruamel.yaml`

@@ -174,6 +174,53 @@ DEBUG: Cached django_4.2.0 to disk
 - **Disk cache**: Safe for concurrent reads, atomic writes prevent corruption
 - **FUSE operation**: Single-threaded mode (`nothreads=False`)
 
+## Cache File Structure Details
+
+### Why Both Package and Version-Specific Files Exist
+
+The cache contains both `{package}.json` and `{package}_{version}.json` files:
+
+| File | PyPI API Endpoint | Contains | Needed For |
+|------|-------------------|----------|------------|
+| `requests.json` | `/pypi/requests/json` | Latest version metadata + all version URLs | Package discovery, version listing |
+| `requests_2.28.0.json` | `/pypi/requests/2.28.0/json` | That specific version's metadata | Accurate ebuild generation |
+
+**This is NOT redundant.** The PyPI API returns different data for each endpoint:
+
+- The **package-only** endpoint returns `info` metadata for the **latest version only**
+- The **version-specific** endpoint returns `info` metadata for **that exact version**
+
+Fields like `requires_python`, `requires_dist` (dependencies), and `classifiers` are **version-specific** and change between versions. You cannot generate an accurate ebuild for `requests-2.20.0` using metadata from `requests-2.28.0`.
+
+### Current Implementation: Dual Cache Paths
+
+The current implementation uses two different path strategies in `pip_metadata.py`:
+
+1. **`get_package_json()` (line 277)**: Flat path in cache root
+   - Path: `self.cache_dir / f"{cache_key}.json"`
+   - Example: `~/.cache/portage-pip-fuse/requests.json`
+   - Contains: Raw PyPI JSON API response
+
+2. **`_get_cache_path()` (lines 103-109)**: Subdirectory based on first 2 chars
+   - Path: `cache_subdir / f"{cache_key}.json"`
+   - Example: `~/.cache/portage-pip-fuse/re/requests.json`
+   - Contains: Processed ebuild-ready data (from `get_complete_package_info()`)
+
+These store **different data** (raw vs processed), not duplicates of the same data.
+
+### Future Consolidation Option
+
+If cleanup is desired later, consolidate both paths to use the subdirectory structure:
+
+1. Refactor `get_package_json()` to use `_get_disk_cache()` / `_set_disk_cache()` helpers
+2. Add `cache_type` parameter to `_get_cache_key()` to distinguish raw vs processed:
+   - `requests.json` - Raw PyPI JSON API response
+   - `requests.complete.json` - Processed ebuild-ready data
+3. Update `get_complete_package_info()` to use 'complete' cache type
+
+**Benefits**: Consistent code, better scalability for large cache directories
+**Trade-offs**: Migration effort, potential for breaking existing caches
+
 ## Future Improvements
 
 Potential enhancements for the caching system:
@@ -183,3 +230,4 @@ Potential enhancements for the caching system:
 3. **Batch prefetching**: Fetch multiple packages in parallel
 4. **Differential updates**: Fetch only changed data after TTL
 5. **Shared memory**: Allow cache sharing between processes
+6. **Consolidate cache paths**: Unify flat and subdirectory strategies (see above)

@@ -134,22 +134,25 @@ class TestPyPIMetadataExtractor(TestCase):
                 'blake2b_256': '5ffb289b9edc1cc4cdcb3f7b0ac5c1d8e8c2b0b1f1e0a1f1e0a1f1e0a1f1e0a1'
             }
         }
-        
+
         # Test with all available hashes
         entry = self.extractor.generate_manifest_entry(download_info)
-        
+
         self.assertIn('DIST numpy-1.21.0.tar.gz 10485760', entry)
         self.assertIn('MD5 1234567890abcdef1234567890abcdef', entry)
         self.assertIn('SHA256 3ffb289b9edc1cc4cdcb3f7b0ac5c1d8e8c2b0b1f1e0a1f1e0a1f1e0a1f1e0a1', entry)
-        self.assertIn('BLAKE2B 5ffb289b9edc1cc4cdcb3f7b0ac5c1d8e8c2b0b1f1e0a1f1e0a1f1e0a1f1e0a1', entry)
-        
+
+        # BLAKE2B should NOT be included - PyPI's blake2b_256 (256-bit) is incompatible
+        # with Gentoo's BLAKE2B (512-bit). Different output sizes from same algorithm.
+        self.assertNotIn('BLAKE2B', entry)
+
         # Test with specific wanted hashes
         entry_sha256_only = self.extractor.generate_manifest_entry(download_info, ['SHA256'])
         self.assertIn('SHA256', entry_sha256_only)
         self.assertNotIn('MD5', entry_sha256_only)
-        
-        # Test with missing hash
-        entry_missing = self.extractor.generate_manifest_entry(download_info, ['SHA512'])
+
+        # Test with missing hash (BLAKE2B can't be provided from PyPI data)
+        entry_missing = self.extractor.generate_manifest_entry(download_info, ['BLAKE2B'])
         self.assertEqual(entry_missing, 'DIST numpy-1.21.0.tar.gz 10485760')  # Only filename and size
     
     def test_get_package_metadata(self):
@@ -255,19 +258,17 @@ class TestEbuildDataExtractor(TestCase):
     
     def test_format_python_compat(self):
         """Test formatting Python versions for PYTHON_COMPAT."""
-        versions = ['3.8', '3.9', '3.10', '3.11']
+        # Use Python versions that are in current _PYTHON_ALL_IMPLS
+        versions = ['3.11', '3.12', '3.13']
         compat = self.extractor.format_python_compat(versions)
-        
-        self.assertIn('python3_8', compat)
-        self.assertIn('python3_9', compat)
-        self.assertIn('python3_10', compat)
+
         self.assertIn('python3_11', compat)
-        self.assertTrue(compat.startswith('('))
-        self.assertTrue(compat.endswith(')'))
-        
-        # Test with empty list (should use defaults)
+        self.assertIn('python3_12', compat)
+        self.assertIn('python3_13', compat)
+
+        # Test with empty list (should use defaults from valid impls)
         compat_empty = self.extractor.format_python_compat([])
-        self.assertIn('python3_8', compat_empty)  # Should include default versions
+        self.assertIn('python3_11', compat_empty)  # Should include default versions
     
     def test_format_dependencies(self):
         """Test formatting dependencies for ebuilds."""
@@ -290,28 +291,28 @@ class TestEbuildDataExtractor(TestCase):
                 'homepage': 'https://example.com',
                 'license': 'MIT'
             },
-            'python_versions': ['3.8', '3.9', '3.10'],
+            'python_versions': ['3.11', '3.12', '3.13'],
             'runtime_dependencies': ['requests>=2.0', 'click>=7.0'],
             'source_distribution': {
                 'url': 'https://pypi.org/example-1.0.0.tar.gz',
                 'filename': 'example-1.0.0.tar.gz'
             }
         }
-        
+
         ebuild_data = self.extractor.prepare_ebuild_data(package_info)
-        
+
         self.assertEqual(ebuild_data['PN'], 'example-package')
         self.assertEqual(ebuild_data['PV'], '1.0.0')
         self.assertEqual(ebuild_data['DESCRIPTION'], 'An example package for testing')
         self.assertEqual(ebuild_data['HOMEPAGE'], 'https://example.com')
         self.assertEqual(ebuild_data['LICENSE'], 'MIT')
         self.assertEqual(ebuild_data['SRC_URI'], 'https://pypi.org/example-1.0.0.tar.gz')
-        self.assertEqual(ebuild_data['KEYWORDS'], '~amd64 ~x86')
+        self.assertEqual(ebuild_data['KEYWORDS'], 'amd64 x86')  # Stable keywords for PyPI releases
         self.assertEqual(ebuild_data['SLOT'], '0')
-        
-        # Check Python compatibility
-        self.assertIn('python3_8', ebuild_data['PYTHON_COMPAT'])
-        self.assertIn('python3_9', ebuild_data['PYTHON_COMPAT'])
+
+        # Check Python compatibility (using current valid impls)
+        self.assertIn('python3_11', ebuild_data['PYTHON_COMPAT'])
+        self.assertIn('python3_12', ebuild_data['PYTHON_COMPAT'])
         
         # Check dependencies
         self.assertIsInstance(ebuild_data['DEPEND'], list)

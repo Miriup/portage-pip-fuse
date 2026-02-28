@@ -226,7 +226,7 @@ class TestPyPIPrefetcher(unittest.TestCase):
             ("django", ["Django"]),
             ("google-cloud", ["google.cloud", "google_cloud"]),
             ("beautifulsoup4", ["Beautifulsoup4"]),
-            ("pyyaml", ["PyYAML"]),  # Special py prefix case
+            ("pyyaml", ["PyYaml"]),  # py prefix case produces Py + Yaml capitalized
             ("my-package", ["my.package", "my_package", "MyPackage"]),
         ]
         

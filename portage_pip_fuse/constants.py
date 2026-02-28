@@ -27,6 +27,12 @@ CACHE_DIR_CANDIDATES = [
 # Default cache directory (first candidate)
 DEFAULT_CACHE_DIR = CACHE_DIR_USER
 
+# Config directory for user settings
+CONFIG_DIR_USER = Path.home() / '.config' / 'portage-pip-fuse'
+
+# Default patch file location for dependency patching
+DEFAULT_PATCH_FILE = CONFIG_DIR_USER / 'patches.json'
+
 # Cache time-to-live in seconds (1 hour)
 DEFAULT_CACHE_TTL = 3600
 

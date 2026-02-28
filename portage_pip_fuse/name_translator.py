@@ -106,7 +106,9 @@ class SimpleNameTranslator(NameTranslatorBase):
     
     # Regex patterns for validation
     # PyPI: Letters, numbers, hyphens, underscores, and dots
-    _pypi_name_pattern = re.compile(r'^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9._-]*[a-zA-Z0-9])$')
+    # Names can start/end with underscore (e.g., "_private") per PEP 508
+    # Single-char names must be alphanumeric; multi-char can start/end with underscore
+    _pypi_name_pattern = re.compile(r'^([a-zA-Z0-9]|[a-zA-Z0-9_][a-zA-Z0-9._-]*[a-zA-Z0-9_])$')
     
     # Gentoo: After normalization, only lowercase letters, numbers, and hyphens
     _gentoo_name_pattern = re.compile(r'^[a-z0-9]+(-[a-z0-9]+)*$')
@@ -283,9 +285,9 @@ class SimpleNameTranslator(NameTranslatorBase):
     def normalize_pypi_name(self, name: str) -> str:
         """
         Normalize a PyPI package name according to PEP 503.
-        
+
         This is useful for comparing package names.
-        
+
         Examples:
             >>> translator = SimpleNameTranslator()
             >>> translator.normalize_pypi_name("Django")
@@ -297,7 +299,9 @@ class SimpleNameTranslator(NameTranslatorBase):
             >>> translator.normalize_pypi_name("My__Package---Name...")
             'my-package-name'
         """
-        return pip_canonicalize_name(name)
+        # PEP 503 normalization, then strip leading/trailing hyphens
+        # that result from leading/trailing separators in the input
+        return pip_canonicalize_name(name).strip('-')
     
     def split_category(self, full_name: str) -> Tuple[str, str]:
         """

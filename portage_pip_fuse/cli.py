@@ -1567,6 +1567,20 @@ To unmount:
         help='Disable SQLite backend and use only PyPI JSON API'
     )
 
+    # Dependency patching options
+    mount_parser.add_argument(
+        '--patch-file',
+        type=str,
+        metavar='PATH',
+        help='Path to dependency patch file (default: ~/.config/portage-pip-fuse/patches.json)'
+    )
+
+    mount_parser.add_argument(
+        '--no-patches',
+        action='store_true',
+        help='Disable the dependency patching system (.sys/ filesystem)'
+    )
+
     # Remove 'mount' from argv and parse remaining args
     mount_argv = [arg for arg in sys.argv[1:] if arg != 'mount']
     args = mount_parser.parse_args(mount_argv)
@@ -1729,6 +1743,14 @@ To unmount:
     if args.timestamps:
         print("Timestamps enabled (using PyPI upload times)")
 
+    if args.no_patches:
+        print("Dependency patching disabled")
+    elif args.patch_file:
+        print(f"Patch file: {args.patch_file}")
+    else:
+        from portage_pip_fuse.constants import DEFAULT_PATCH_FILE
+        print(f"Patch file: {DEFAULT_PATCH_FILE} (default)")
+
     if pid_file_path:
         print(f"PID file: {pid_file_path}")
 
@@ -1748,7 +1770,9 @@ To unmount:
             debug=args.debug,
             cache_ttl=args.cache_ttl,
             cache_dir=str(cache_dir),
-            filter_config=filter_config
+            filter_config=filter_config,
+            patch_file=args.patch_file,
+            no_patches=args.no_patches
         )
     except KeyboardInterrupt:
         print("\nUnmounting...")
