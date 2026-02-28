@@ -422,6 +422,51 @@ class PyPIMetadataExtractor:
         
         return None
     
+    def _normalize_sdist_filename(self, filename: str) -> str:
+        """
+        Normalize sdist filename according to PEP 625 rules.
+
+        The pypi.eclass normalizes project names in sdist filenames:
+        - Replace any run of [-._]+ with a single underscore
+        - Convert to lowercase
+
+        For example: MarkupSafe-2.1.2.tar.gz -> markupsafe-2.1.2.tar.gz
+
+        Args:
+            filename: Original PyPI filename
+
+        Returns:
+            Normalized filename matching what pypi.eclass downloads
+
+        Examples:
+            >>> extractor = PyPIMetadataExtractor()
+            >>> extractor._normalize_sdist_filename('MarkupSafe-2.1.2.tar.gz')
+            'markupsafe-2.1.2.tar.gz'
+            >>> extractor._normalize_sdist_filename('Jinja2-3.1.2.tar.gz')
+            'jinja2-3.1.2.tar.gz'
+            >>> extractor._normalize_sdist_filename('zope.interface-5.4.0.tar.gz')
+            'zope_interface-5.4.0.tar.gz'
+            >>> extractor._normalize_sdist_filename('my--pkg-1.0.tar.gz')
+            'my_pkg-1.0.tar.gz'
+            >>> extractor._normalize_sdist_filename('numpy-1.21.0.tar.gz')
+            'numpy-1.21.0.tar.gz'
+        """
+        # Match pattern: {name}-{version}.{suffix}
+        # Version starts after a hyphen followed by a digit
+        match = re.search(r'-(\d)', filename)
+        if not match:
+            return filename  # Can't parse, return as-is
+
+        name_end = match.start()
+        name_part = filename[:name_end]
+        rest = filename[name_end:]  # includes the hyphen
+
+        # Normalize the name part according to PEP 625
+        # Replace runs of [-._] with underscore, then lowercase
+        normalized_name = re.sub(r'[-._]+', '_', name_part).lower()
+
+        return normalized_name + rest
+
     def generate_manifest_entry(self, download_info: Dict[str, Any],
                                wanted_hashes: Optional[List[str]] = None) -> str:
         """
@@ -434,6 +479,9 @@ class PyPIMetadataExtractor:
         NOT compatible - different output sizes from the same algorithm. We cannot
         use PyPI's blake2b_256 as Gentoo's BLAKE2B. SHA256 is sufficient for
         portage verification.
+
+        The filename is normalized according to PEP 625 to match what pypi.eclass
+        downloads (e.g., MarkupSafe-2.1.2.tar.gz -> markupsafe-2.1.2.tar.gz).
 
         Args:
             download_info: Download information dictionary
@@ -458,8 +506,15 @@ class PyPIMetadataExtractor:
             True
             >>> 'SHA256' in entry
             True
+            >>> # Test with mixed-case filename
+            >>> download_info['filename'] = 'MarkupSafe-2.1.2.tar.gz'
+            >>> entry = extractor.generate_manifest_entry(download_info)
+            >>> entry.startswith('DIST markupsafe-2.1.2.tar.gz')
+            True
         """
         filename = download_info.get('filename', '')
+        # Use original filename - pypi.eclass will use PYPI_NO_NORMALIZE
+        # to match. PyPI doesn't normalize filenames for older uploads.
         size = download_info.get('size', 0)
         digests = download_info.get('digests', {})
 
@@ -810,16 +865,32 @@ class PyPIMetadataExtractor:
         requires_python = metadata.get('python_requires', '')
         specifier_versions = self.parse_requires_python(requires_python) if requires_python else []
 
-        # Prefer requires_python over classifiers because:
-        # 1. Classifiers are often incomplete (e.g., only list min version)
-        # 2. requires_python is machine-readable and more reliable
-        # 3. Modern packages often omit version classifiers entirely
-        if specifier_versions:
+        # Combine requires_python with classifiers for best accuracy:
+        # - requires_python provides the minimum version
+        # - classifiers provide tested/supported versions (upper bound)
+        # When requires_python has no upper bound (e.g., >=3.7), use classifiers
+        # to cap the maximum supported version.
+        specific_classifiers = [v for v in classifier_versions if v != '3']
+
+        if specifier_versions and specific_classifiers:
+            # If requires_python has no upper bound, use classifiers to cap it
+            # Check if requires_python is open-ended (only >= constraint)
+            has_upper_bound = '<' in requires_python if requires_python else False
+            if not has_upper_bound:
+                # Use intersection: versions from requires_python that are in classifiers
+                # But if classifier max < specifier max, cap at classifier max
+                max_classifier = max(specific_classifiers, key=lambda v: tuple(map(int, v.split('.'))))
+                python_versions = [v for v in specifier_versions
+                                   if tuple(map(int, v.split('.'))) <= tuple(map(int, max_classifier.split('.')))]
+                logger.debug(f"Capping requires_python '{requires_python}' at classifier max {max_classifier} -> {python_versions}")
+            else:
+                python_versions = specifier_versions
+                logger.debug(f"Using requires_python '{requires_python}' (has upper bound) -> {python_versions}")
+        elif specifier_versions:
             python_versions = specifier_versions
             logger.debug(f"Using requires_python '{requires_python}' -> {python_versions}")
-        elif classifier_versions:
-            # Filter out generic '3' - only use specific versions
-            python_versions = [v for v in classifier_versions if v != '3']
+        elif specific_classifiers:
+            python_versions = specific_classifiers
             logger.debug(f"Using classifiers -> {python_versions}")
         else:
             python_versions = []
@@ -1739,9 +1810,29 @@ class EbuildDataExtractor:
         if package_info is None:
             logger.error("Cannot prepare ebuild data: package_info is None")
             return {}
-        
+
         metadata = package_info.get('metadata', {})
-        
+
+        # Extract original PyPI project name from sdist filename
+        # PyPI normalizes the 'name' field but keeps original case in filenames
+        # e.g., name="pillow" but filename="Pillow-9.4.0.tar.gz"
+        sdist = package_info.get('source_distribution') or {}
+        sdist_filename = sdist.get('filename', '')
+        version = metadata.get('version', '')
+
+        # Extract project name from filename: {project}-{version}.tar.gz
+        pypi_pn = metadata.get('name', '')  # fallback to normalized name
+        if sdist_filename and version:
+            # Remove version and extension to get original project name
+            suffix = f'-{version}.tar.gz'
+            if sdist_filename.endswith(suffix):
+                pypi_pn = sdist_filename[:-len(suffix)]
+            else:
+                # Try .zip
+                suffix = f'-{version}.zip'
+                if sdist_filename.endswith(suffix):
+                    pypi_pn = sdist_filename[:-len(suffix)]
+
         ebuild_data = {
             # Basic package information
             'PN': metadata.get('name', ''),
@@ -1749,10 +1840,10 @@ class EbuildDataExtractor:
             'DESCRIPTION': metadata.get('summary', ''),
             'HOMEPAGE': metadata.get('homepage', ''),
             'LICENSE': self.translate_license(metadata.get('license', '')),
-            
-            # PyPI eclass variables
-            'PYPI_PN': metadata.get('name', ''),
-            'PYPI_PV': metadata.get('version', ''),
+
+            # PyPI eclass variables - use original case from filename
+            'PYPI_PN': pypi_pn,
+            'PYPI_PV': version,
             
             # Python compatibility
             'PYTHON_COMPAT': self.format_python_compat(
