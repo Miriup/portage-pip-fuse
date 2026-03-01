@@ -1653,7 +1653,7 @@ cache-formats = md5-dict
             elif parsed['type'] == 'sys_root':
                 # /.sys - show all virtual filesystem sections
                 if self.patch_store is not None:
-                    entries.extend(['dependencies', 'dependencies-patch', 'depend', 'depend-patch'])
+                    entries.extend(['RDEPEND', 'RDEPEND-patch', 'DEPEND', 'DEPEND-patch'])
                 if self.compat_patch_store is not None:
                     entries.extend(['python-compat', 'python-compat-patch'])
                 if self.append_patch_store is not None:
