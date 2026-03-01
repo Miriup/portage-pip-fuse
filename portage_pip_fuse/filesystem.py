@@ -1247,8 +1247,22 @@ cache-formats = md5-dict
             # Dependency file in .sys/dependencies/.../version/ or .sys/depend/.../version/
             if self.patch_store is None:
                 raise FuseOSError(errno.ENOENT)
-            # These are virtual files representing dependencies
+            # Check if this dependency patch actually exists
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
             dep_name = parsed['dep']
+            dep_type = 'rdepend' if parsed['type'] == 'sys_deps_dep' else 'depend'
+
+            # Get patches and check if this dep exists as an 'add' patch
+            patches = self.patch_store.get_patches(category, package, version)
+            dep_exists = any(
+                p.operation == 'add' and p.new_dep == dep_name and p.dep_type == dep_type
+                for p in patches
+            )
+            if not dep_exists:
+                raise FuseOSError(errno.ENOENT)
+
             attrs.update({
                 'st_mode': stat.S_IFREG | 0o644,
                 'st_nlink': 1,
@@ -1396,6 +1410,17 @@ cache-formats = md5-dict
             flag = parsed['flag']
             # Reject invalid USE flag names (e.g., vim swap files like .foo.swp)
             if not is_valid_use_flag(flag):
+                raise FuseOSError(errno.ENOENT)
+            # Check if this flag actually exists as an 'add' patch
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+            patches = self.iuse_patch_store.get_patches(category, package, version)
+            flag_exists = any(
+                p.operation == 'add' and p.flag == flag
+                for p in patches
+            )
+            if not flag_exists:
                 raise FuseOSError(errno.ENOENT)
             # USE flag files are just empty files that indicate the flag exists
             attrs.update({
