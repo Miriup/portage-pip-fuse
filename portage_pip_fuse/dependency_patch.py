@@ -523,7 +523,7 @@ class DependencyPatchStore:
 
     def _extract_package_name(self, dep: str) -> Optional[str]:
         """
-        Extract package name from a dependency atom.
+        Extract package name from a dependency atom or || ( ) group.
 
         Examples:
             >>> store = DependencyPatchStore()
@@ -531,7 +531,19 @@ class DependencyPatchStore:
             'dev-python/urllib3'
             >>> store._extract_package_name('dev-python/requests')
             'dev-python/requests'
+            >>> store._extract_package_name('|| ( =dev-python/httpx-0.28.1[${PYTHON_USEDEP}] =dev-python/httpx-0.28.1.0[${PYTHON_USEDEP}] )')
+            'dev-python/httpx'
         """
+        # Handle || ( ) groups - extract first atom inside
+        if dep.startswith('|| ('):
+            # Extract atoms from inside || ( ... )
+            inner = dep[4:-1].strip()  # Remove "|| (" and ")"
+            atoms = inner.split()
+            if atoms:
+                # Recursively process the first atom
+                return self._extract_package_name(atoms[0])
+            return None
+
         # Remove operator prefix
         dep = dep.lstrip('>=<!=~')
 
