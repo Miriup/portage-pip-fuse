@@ -562,6 +562,101 @@ git remote add origin git@github.com:user/pypi-config.git
 git push -u origin main
 ```
 
+## PEP517 Backend Patching
+
+The `.sys/pep517/` virtual filesystem allows overriding the `DISTUTILS_USE_PEP517` value in generated ebuilds. This is useful when portage-pip-fuse's auto-detection fails or when a package requires a specific build backend.
+
+### Directory Structure
+
+```
+/var/db/repos/pypi/.sys/
+    pep517/
+        dev-python/
+            {package}/
+                {version}             # File containing backend name
+                _all                   # Global for all versions
+    pep517-patch/
+        dev-python/
+            {package}/
+                {version}.patch
+                _all.patch
+```
+
+### Valid Backend Values
+
+| Value | Description |
+|-------|-------------|
+| `standalone` | Auto-detect (default) |
+| `setuptools` | setuptools backend |
+| `flit` | flit_core backend |
+| `hatchling` | hatchling backend |
+| `poetry` | poetry-core backend |
+| `pdm-backend` | pdm backend |
+| `maturin` | maturin (Rust) backend |
+| `meson-python` | meson-python backend |
+| `scikit-build-core` | scikit-build-core backend |
+| `sip` | sip backend |
+| `no` | Disable PEP517 (legacy setup.py) |
+
+### Example: Fix PEP517 Backend for pypdf
+
+When a package fails to build due to PEP517 backend mismatch:
+
+```bash
+# Set the backend for a specific version
+echo 'flit' > /var/db/repos/pypi/.sys/pep517/dev-python/pypdf/5.4.0
+
+# Or for all versions
+echo 'flit' > /var/db/repos/pypi/.sys/pep517/dev-python/pypdf/_all
+
+# Verify in the ebuild
+grep DISTUTILS_USE_PEP517 /var/db/repos/pypi/dev-python/pypdf/pypdf-5.4.0.ebuild
+# Output: DISTUTILS_USE_PEP517=flit
+```
+
+### Patch File Format
+
+The patch file format is simpler than other patch types since it's a single value:
+
+```
+# Comment
+== flit
+```
+
+### Auto-Fix with bashrc Hook
+
+A portage bashrc hook can automatically detect PEP517 mismatches and either patch them or provide instructions:
+
+```bash
+# Install the hook
+sudo cp docs/bashrc/pep517-autofix.bashrc /etc/portage/bashrc
+
+# Or source from existing bashrc:
+echo 'source /path/to/pep517-autofix.bashrc' >> /etc/portage/bashrc
+```
+
+When a build fails due to PEP517 mismatch, the hook will:
+1. Detect the actual backend from pyproject.toml
+2. Map it to the correct DISTUTILS_USE_PEP517 value
+3. Auto-patch the filesystem (if not sandboxed)
+4. Print instructions for manual fix (if sandboxed)
+
+Example output when hook detects a mismatch:
+```
+ * ==============================================
+ * PEP517 Backend Mismatch Detected!
+ * ==============================================
+ * The package uses: flit_core.buildapi
+ * Expected DISTUTILS_USE_PEP517=flit
+ *
+ * To fix, run:
+ *   echo 'flit' > /var/db/repos/pypi/.sys/pep517/dev-python/pypdf/5.4.0
+ *
+ * Then re-emerge the package:
+ *   emerge -1 dev-python/pypdf
+ * ==============================================
+```
+
 ## Limitations
 
 - USE flag conditions are not directly patchable (add/remove entire atoms instead)

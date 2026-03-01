@@ -269,6 +269,7 @@ The `.sys/` virtual filesystem allows runtime modification of generated ebuilds:
 | `.sys/python-compat/` | Adjust Python version compatibility |
 | `.sys/iuse/` | Add/remove USE flags |
 | `.sys/ebuild-append/` | Add custom phase functions |
+| `.sys/pep517/` | Override DISTUTILS_USE_PEP517 backend |
 
 ### Quick Example: Fix a Package
 
@@ -281,6 +282,9 @@ touch '/var/db/repos/pypi/.sys/RDEPEND/dev-python/broken-pkg/_all/>=dev-python::
 
 # Add custom src_configure
 echo 'export MY_VAR=1' > /var/db/repos/pypi/.sys/ebuild-append/dev-python/pkg/_all/src_configure
+
+# Fix PEP517 backend mismatch
+echo 'flit' > /var/db/repos/pypi/.sys/pep517/dev-python/pypdf/_all
 ```
 
 See [docs/build-error-fixes.md](docs/build-error-fixes.md) for comprehensive examples.

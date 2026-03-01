@@ -27,6 +27,7 @@ from .constants import REPO_NAME, DEFAULT_PATCH_FILE, get_mount_point_key
 from .dependency_patch import DependencyPatchStore
 from .ebuild_append_patch import EbuildAppendPatchStore, is_valid_phase_name
 from .iuse_patch import IUSEPatchStore, is_valid_use_flag
+from .pep517_patch import PEP517PatchStore, is_valid_pep517_backend, VALID_PEP517_BACKENDS
 from .python_compat_patch import PythonCompatPatchStore
 from .interrupt import InterruptChecker, check_interrupt
 from .prefetcher import create_prefetched_translator
@@ -159,6 +160,15 @@ class PortagePipFS(Operations):
         else:
             self.iuse_patch_store = None
 
+        # Initialize PEP517 patch store (uses same file as other patches)
+        if not no_patches:
+            patch_path = patch_file or str(DEFAULT_PATCH_FILE)
+            self.pep517_patch_store = PEP517PatchStore(patch_path, mount_point=mount_point)
+            logger.info(f"PEP517 patching enabled, using {self.pep517_patch_store.storage_path}"
+                       + (f" (mount: {mount_point})" if mount_point else ""))
+        else:
+            self.pep517_patch_store = None
+
         # Git worktree file content (stored in patches.json under mount point)
         self._git_file_content: Optional[bytes] = None
         if not no_patches:
@@ -195,7 +205,12 @@ class PortagePipFS(Operations):
             "/.sys/iuse",
             "/.sys/iuse/dev-python",
             "/.sys/iuse-patch",
-            "/.sys/iuse-patch/dev-python"
+            "/.sys/iuse-patch/dev-python",
+            # .sys virtual filesystem for PEP517 backend patching
+            "/.sys/pep517",
+            "/.sys/pep517/dev-python",
+            "/.sys/pep517-patch",
+            "/.sys/pep517-patch/dev-python"
         }
         
         # Static files
@@ -642,6 +657,43 @@ cache-formats = md5-dict
                     version = filename[:-6]  # Remove .patch
                     return {
                         'type': 'sys_iuse_patch_file',
+                        'category': parts[2],
+                        'package': parts[3],
+                        'version': version,
+                        'filename': filename
+                    }
+
+        elif parts[1] == 'pep517':
+            if len(parts) == 2:
+                # /.sys/pep517
+                return {'type': 'sys_pep517'}
+            elif len(parts) == 3:
+                # /.sys/pep517/dev-python
+                return {'type': 'sys_pep517_category', 'category': parts[2]}
+            elif len(parts) == 4:
+                # /.sys/pep517/dev-python/pypdf
+                return {'type': 'sys_pep517_package', 'category': parts[2], 'package': parts[3]}
+            elif len(parts) == 5:
+                # /.sys/pep517/dev-python/pypdf/5.4.0 - file containing backend name
+                return {'type': 'sys_pep517_version', 'category': parts[2], 'package': parts[3], 'version': parts[4]}
+
+        elif parts[1] == 'pep517-patch':
+            if len(parts) == 2:
+                # /.sys/pep517-patch
+                return {'type': 'sys_pep517_patch'}
+            elif len(parts) == 3:
+                # /.sys/pep517-patch/dev-python
+                return {'type': 'sys_pep517_patch_category', 'category': parts[2]}
+            elif len(parts) == 4:
+                # /.sys/pep517-patch/dev-python/pypdf
+                return {'type': 'sys_pep517_patch_package', 'category': parts[2], 'package': parts[3]}
+            elif len(parts) == 5:
+                # /.sys/pep517-patch/dev-python/pypdf/5.4.0.patch
+                filename = parts[4]
+                if filename.endswith('.patch'):
+                    version = filename[:-6]  # Remove .patch
+                    return {
+                        'type': 'sys_pep517_patch_file',
                         'category': parts[2],
                         'package': parts[3],
                         'version': version,
@@ -1528,6 +1580,57 @@ cache-formats = md5-dict
                 'st_nlink': 1,
                 'st_size': len(content.encode('utf-8')),
             })
+        # Handle .sys/pep517/ virtual filesystem paths
+        elif parsed['type'] in ('sys_pep517', 'sys_pep517_category',
+                                'sys_pep517_patch', 'sys_pep517_patch_category'):
+            # Static .sys/pep517 directories
+            attrs.update({
+                'st_mode': stat.S_IFDIR | 0o755,
+                'st_nlink': 2,
+                'st_size': 4096,
+            })
+        elif parsed['type'] in ('sys_pep517_package', 'sys_pep517_patch_package'):
+            # Dynamic .sys/pep517 directories - verify package exists
+            if self.pep517_patch_store is None:
+                raise FuseOSError(errno.ENOENT)
+            gentoo_name = parsed['package']
+            pypi_name = self._gentoo_to_pypi(gentoo_name)
+            if not pypi_name or not self._package_exists(pypi_name):
+                raise FuseOSError(errno.ENOENT)
+            attrs.update({
+                'st_mode': stat.S_IFDIR | 0o755,
+                'st_nlink': 2,
+                'st_size': 4096,
+            })
+        elif parsed['type'] == 'sys_pep517_version':
+            # Version file in .sys/pep517/.../version - contains backend name
+            if self.pep517_patch_store is None:
+                raise FuseOSError(errno.ENOENT)
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+            backend = self.pep517_patch_store.get_backend(category, package, version)
+            if backend is None:
+                # No patch for this version - file doesn't exist
+                raise FuseOSError(errno.ENOENT)
+            attrs.update({
+                'st_mode': stat.S_IFREG | 0o644,
+                'st_nlink': 1,
+                'st_size': len(backend.encode('utf-8')) + 1,  # +1 for newline
+            })
+        elif parsed['type'] == 'sys_pep517_patch_file':
+            # Patch file in .sys/pep517-patch/
+            if self.pep517_patch_store is None:
+                raise FuseOSError(errno.ENOENT)
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+            content = self.pep517_patch_store.generate_patch_file(category, package, version)
+            attrs.update({
+                'st_mode': stat.S_IFREG | 0o644,
+                'st_nlink': 1,
+                'st_size': len(content.encode('utf-8')),
+            })
         # Handle .sys/.git worktree file
         elif parsed['type'] == 'sys_git_file':
             content = self._get_git_file_content()
@@ -1660,6 +1763,8 @@ cache-formats = md5-dict
                     entries.extend(['ebuild-append', 'ebuild-append-patch'])
                 if self.iuse_patch_store is not None:
                     entries.extend(['iuse', 'iuse-patch'])
+                if self.pep517_patch_store is not None:
+                    entries.extend(['pep517', 'pep517-patch'])
                 # Show .git file if it exists (for git worktree support)
                 if self._get_git_file_content() is not None:
                     entries.append('.git')
@@ -1988,6 +2093,60 @@ cache-formats = md5-dict
                     for ver in versions:
                         entries.append(f"{ver}.patch")
 
+            # Handle .sys/pep517/ directories
+            elif parsed['type'] == 'sys_pep517':
+                # /.sys/pep517 - show categories
+                if self.pep517_patch_store is not None:
+                    entries.append('dev-python')
+
+            elif parsed['type'] == 'sys_pep517_category':
+                # /.sys/pep517/dev-python - show packages with patches or cached packages
+                if self.pep517_patch_store is not None:
+                    # Show packages that have patches
+                    for cat, pkg, ver in self.pep517_patch_store.list_patched_packages():
+                        if cat == parsed['category'] and pkg not in entries:
+                            entries.append(pkg)
+                    # Also show all cached packages for convenience
+                    cache_key = 'dev-python'
+                    if cache_key in self._category_cache:
+                        cached_packages, _ = self._category_cache[cache_key]
+                        for pkg in cached_packages:
+                            if pkg not in entries:
+                                entries.append(pkg)
+
+            elif parsed['type'] == 'sys_pep517_package':
+                # /.sys/pep517/dev-python/pypdf - show versions with patches + _all
+                if self.pep517_patch_store is not None:
+                    category = parsed['category']
+                    package = parsed['package']
+                    # Show versions that have patches
+                    versions = self.pep517_patch_store.get_package_versions_with_patches(category, package)
+                    entries.extend(versions)
+                    # If _all is not in patches, still show it as an option
+                    if '_all' not in entries:
+                        entries.append('_all')
+
+            elif parsed['type'] == 'sys_pep517_patch':
+                # /.sys/pep517-patch - show categories
+                if self.pep517_patch_store is not None:
+                    entries.append('dev-python')
+
+            elif parsed['type'] == 'sys_pep517_patch_category':
+                # /.sys/pep517-patch/dev-python - show packages with patches
+                if self.pep517_patch_store is not None:
+                    for cat, pkg, ver in self.pep517_patch_store.list_patched_packages():
+                        if cat == parsed['category'] and pkg not in entries:
+                            entries.append(pkg)
+
+            elif parsed['type'] == 'sys_pep517_patch_package':
+                # /.sys/pep517-patch/dev-python/pypdf - show version.patch files
+                if self.pep517_patch_store is not None:
+                    category = parsed['category']
+                    package = parsed['package']
+                    versions = self.pep517_patch_store.get_package_versions_with_patches(category, package)
+                    for ver in versions:
+                        entries.append(f"{ver}.patch")
+
         except InterruptedError:
             logger.info(f"readdir interrupted for {path}")
             # Return minimal result on interrupt
@@ -2088,6 +2247,30 @@ cache-formats = md5-dict
             content = self.iuse_patch_store.generate_patch_file(category, package, version).encode('utf-8')
             return content[offset:offset + length]
 
+        # Handle .sys/pep517/ file reads
+        elif parsed['type'] == 'sys_pep517_version':
+            # Read a PEP517 backend file - return the backend name
+            if self.pep517_patch_store is None:
+                raise FuseOSError(errno.ENOENT)
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+            backend = self.pep517_patch_store.get_backend(category, package, version)
+            if backend is None:
+                raise FuseOSError(errno.ENOENT)
+            content = (backend + '\n').encode('utf-8')
+            return content[offset:offset + length]
+
+        elif parsed['type'] == 'sys_pep517_patch_file':
+            # Read a PEP517 patch file
+            if self.pep517_patch_store is None:
+                raise FuseOSError(errno.ENOENT)
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+            content = self.pep517_patch_store.generate_patch_file(category, package, version).encode('utf-8')
+            return content[offset:offset + length]
+
         # Handle .sys/.git file read
         elif parsed['type'] == 'sys_git_file':
             content = self._get_git_file_content()
@@ -2137,7 +2320,8 @@ cache-formats = md5-dict
             return 0
         elif parsed['type'] in ['sys_deps_dep', 'sys_depend_dep', 'sys_patch_file',
                                   'sys_compat_impl', 'sys_compat_patch_file',
-                                  'sys_append_patch_file', 'sys_iuse_patch_file']:
+                                  'sys_append_patch_file', 'sys_iuse_patch_file',
+                                  'sys_pep517_version', 'sys_pep517_patch_file']:
             # Allow opening .sys files
             return 0
         elif parsed['type'] == 'sys_append_phase':
@@ -2353,8 +2537,15 @@ cache-formats = md5-dict
             ])
         else:
             # Sdist-based ebuild - use pypi eclass
+            # Get PEP517 backend - check patches first, then default to standalone
+            pep517_backend = 'standalone'
+            if self.pep517_patch_store is not None and package and version:
+                patched = self.pep517_patch_store.get_backend(category, package, version)
+                if patched:
+                    pep517_backend = patched
+
             ebuild_lines.extend([
-                f"DISTUTILS_USE_PEP517=setuptools",
+                f"DISTUTILS_USE_PEP517={pep517_backend}",
                 f"PYTHON_COMPAT=( {python_compat} )",
                 f"# PYPI_* variables must be set before inherit",
                 f"PYPI_NO_NORMALIZE=1",
@@ -2560,6 +2751,13 @@ cache-formats = md5-dict
                 logger.info(f"IUSE patches saved to {self.iuse_patch_store.storage_path}")
             else:
                 logger.error("Failed to save IUSE patches!")
+
+        if self.pep517_patch_store is not None and self.pep517_patch_store.is_dirty:
+            logger.info("Saving PEP517 patches...")
+            if self.pep517_patch_store.save():
+                logger.info(f"PEP517 patches saved to {self.pep517_patch_store.storage_path}")
+            else:
+                logger.error("Failed to save PEP517 patches!")
 
         # Close the extractor properly
         if hasattr(self.pypi_extractor, 'close'):
@@ -2768,6 +2966,21 @@ cache-formats = md5-dict
             logger.info("Created .sys/.git file for git worktree support")
             return 0
 
+        if parsed['type'] == 'sys_pep517_version':
+            # touch /.sys/pep517/dev-python/pkg/ver
+            # Creates a PEP517 backend file - content will be set via write()
+            if self.pep517_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+            # Just allow creation - actual content set via write()
+            return 0
+
+        if parsed['type'] == 'sys_pep517_patch_file':
+            # touch /.sys/pep517-patch/dev-python/pkg/ver.patch
+            if self.pep517_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+            # Just allow creation - actual content set via write()
+            return 0
+
         raise FuseOSError(errno.EROFS)
 
     def unlink(self, path):
@@ -2864,6 +3077,20 @@ cache-formats = md5-dict
             self._set_git_file_content(None)
             self._save_git_file_content()
             logger.info("Removed .sys/.git file")
+            return
+
+        if parsed['type'] == 'sys_pep517_version':
+            # rm /.sys/pep517/dev-python/pkg/ver
+            if self.pep517_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+
+            self.pep517_patch_store.remove_backend(category, package, version)
+            self._invalidate_package_cache(category, package)
+            logger.info(f"Removed PEP517 backend via rm: from {category}/{package}/{version}")
             return
 
         raise FuseOSError(errno.EROFS)
@@ -3024,6 +3251,47 @@ cache-formats = md5-dict
             logger.info(f"Wrote .git file content: {content[:50]}...")
             return len(data)
 
+        if parsed['type'] == 'sys_pep517_version':
+            # echo "flit" > /.sys/pep517/dev-python/pkg/ver
+            if self.pep517_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+
+            # Decode and validate backend
+            backend = data.decode('utf-8', errors='replace').strip()
+            if not is_valid_pep517_backend(backend):
+                logger.warning(f"Invalid PEP517 backend: {backend}. Valid values: {', '.join(sorted(VALID_PEP517_BACKENDS))}")
+                raise FuseOSError(errno.EINVAL)
+
+            self.pep517_patch_store.set_backend(category, package, version, backend)
+            self._invalidate_package_cache(category, package)
+            logger.info(f"Set PEP517 backend via write: {backend} for {category}/{package}/{version}")
+
+            return len(data)
+
+        if parsed['type'] == 'sys_pep517_patch_file':
+            # echo "== flit" > /.sys/pep517-patch/dev-python/pkg/ver.patch
+            if self.pep517_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+
+            # Decode and parse patch content
+            content = data.decode('utf-8', errors='replace')
+
+            # Remove existing patch and import new one
+            self.pep517_patch_store.remove_backend(category, package, version)
+            count = self.pep517_patch_store.parse_patch_file(content, category, package, version)
+            self._invalidate_package_cache(category, package)
+            logger.info(f"Imported {count} PEP517 patches via write to {path}")
+
+            return len(data)
+
         raise FuseOSError(errno.EROFS)
 
     def truncate(self, path, length, fh=None):
@@ -3110,6 +3378,34 @@ cache-formats = md5-dict
             if length == 0:
                 self._set_git_file_content(b'')
                 self._save_git_file_content()
+            return
+
+        if parsed['type'] == 'sys_pep517_version':
+            # Support truncate for PEP517 backend files
+            if self.pep517_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+
+            if length == 0:
+                # truncate to 0 = remove backend patch
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                self.pep517_patch_store.remove_backend(category, package, version)
+                self._invalidate_package_cache(category, package)
+            return
+
+        if parsed['type'] == 'sys_pep517_patch_file':
+            # Support truncate for PEP517 patch files
+            if self.pep517_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+
+            if length == 0:
+                # truncate to 0 = remove backend patch
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                self.pep517_patch_store.remove_backend(category, package, version)
+                self._invalidate_package_cache(category, package)
             return
 
         raise FuseOSError(errno.EROFS)
