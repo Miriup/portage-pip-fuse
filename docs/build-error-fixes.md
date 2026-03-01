@@ -8,9 +8,9 @@ When packages fail to build, you can use the `.sys/` virtual filesystem to patch
 |------------|-------------------|
 | Python API incompatibility | `.sys/python-compat/` |
 | Missing/wrong Python version | `.sys/python-compat/` |
-| Runtime dependency conflict | `.sys/dependencies/` |
-| Missing runtime dependency | `.sys/dependencies/` |
-| Missing build dependency | `.sys/depend/` |
+| Runtime dependency conflict | `.sys/RDEPEND/` |
+| Missing runtime dependency | `.sys/RDEPEND/` |
+| Missing build dependency | `.sys/DEPEND/` |
 | Missing USE flags | `.sys/iuse/` |
 | Custom build phase needed | `.sys/ebuild-append/` |
 
@@ -212,7 +212,7 @@ distutils-r1_src_configure
 
 ## Build-Time Dependencies (DEPEND)
 
-Use `.sys/depend/` when a package needs build-time dependencies (headers, libraries for compilation).
+Use `.sys/DEPEND/` when a package needs build-time dependencies (headers, libraries for compilation).
 
 ### Common Symptoms
 
@@ -223,7 +223,7 @@ Use `.sys/depend/` when a package needs build-time dependencies (headers, librar
 ### Directory Structure
 
 ```
-.sys/depend/
+.sys/DEPEND/
     dev-python/
         {package}/
             {version}/
@@ -236,8 +236,8 @@ Use `.sys/depend/` when a package needs build-time dependencies (headers, librar
 **Add build dependencies for gevent:**
 ```bash
 # gevent needs c-ares and libev headers to build against system libraries
-touch '/var/db/repos/pypi/.sys/depend/dev-python/gevent/_all/net-dns::c-ares'
-touch '/var/db/repos/pypi/.sys/depend/dev-python/gevent/_all/dev-libs::libev'
+touch '/var/db/repos/pypi/.sys/DEPEND/dev-python/gevent/_all/net-dns::c-ares'
+touch '/var/db/repos/pypi/.sys/DEPEND/dev-python/gevent/_all/dev-libs::libev'
 
 # Verify
 cat /var/db/repos/pypi/dev-python/gevent/gevent-25.9.1.ebuild | grep -E '^DEPEND='
@@ -245,7 +245,7 @@ cat /var/db/repos/pypi/dev-python/gevent/gevent-25.9.1.ebuild | grep -E '^DEPEND
 
 ## Runtime Dependency Patches
 
-Use `.sys/dependencies/` or `.sys/dependencies-patch/` when dependency version constraints cause conflicts.
+Use `.sys/RDEPEND/` or `.sys/RDEPEND-patch/` when dependency version constraints cause conflicts.
 
 ### Common Symptoms
 
@@ -258,8 +258,8 @@ Use `.sys/dependencies/` or `.sys/dependencies-patch/` when dependency version c
 
 | Interface | Path | Use When |
 |-----------|------|----------|
-| Browse & modify | `.sys/dependencies/` | Want to see current dependencies |
-| Direct patch file | `.sys/dependencies-patch/` | Prefer direct patch creation, recommended for slot conflicts |
+| Browse & modify | `.sys/RDEPEND/` | Want to see current dependencies |
+| Direct patch file | `.sys/RDEPEND-patch/` | Prefer direct patch creation, recommended for slot conflicts |
 
 ### Patch Format
 
@@ -275,7 +275,7 @@ Use `.sys/dependencies/` or `.sys/dependencies-patch/` when dependency version c
 
 **Loosen exact version to minimum (fixes revision conflicts):**
 ```bash
-cat > /var/db/repos/pypi/.sys/dependencies-patch/dev-python/open-webui/0.8.5.patch << 'EOF'
+cat > /var/db/repos/pypi/.sys/RDEPEND-patch/dev-python/open-webui/0.8.5.patch << 'EOF'
 # httpx: gentoo has 0.28.1-r1, fuse wants exactly 0.28.1
 -> =dev-python/httpx-0.28.1[${PYTHON_USEDEP}] >=dev-python/httpx-0.28.1[${PYTHON_USEDEP}]
 EOF
@@ -283,7 +283,7 @@ EOF
 
 **Lower minimum version requirement:**
 ```bash
-cat > /var/db/repos/pypi/.sys/dependencies-patch/dev-python/black/26.1.0.patch << 'EOF'
+cat > /var/db/repos/pypi/.sys/RDEPEND-patch/dev-python/black/26.1.0.patch << 'EOF'
 # pathspec: package wants >=1.0 but gentoo has 0.12.1
 -> >=dev-python/pathspec-1.0[${PYTHON_USEDEP}] >=dev-python/pathspec-0.12[${PYTHON_USEDEP}]
 EOF
@@ -291,7 +291,7 @@ EOF
 
 **Remove upper bound constraint:**
 ```bash
-cat > /var/db/repos/pypi/.sys/dependencies-patch/dev-python/youtube-transcript-api/1.2.4.patch << 'EOF'
+cat > /var/db/repos/pypi/.sys/RDEPEND-patch/dev-python/youtube-transcript-api/1.2.4.patch << 'EOF'
 # defusedxml: package wants <0.8 but gentoo has 0.8.0_rc2
 -> <dev-python/defusedxml-0.8[${PYTHON_USEDEP}] dev-python/defusedxml[${PYTHON_USEDEP}]
 EOF
@@ -301,7 +301,7 @@ EOF
 
 **Loosen version constraint:**
 ```bash
-cd /var/db/repos/pypi/.sys/dependencies/dev-python/{package}/{version}/
+cd /var/db/repos/pypi/.sys/RDEPEND/dev-python/{package}/{version}/
 mv '=dev-python::urllib3-1.26.0[${PYTHON_USEDEP}]' \
    '>=dev-python::urllib3-1.26.0[${PYTHON_USEDEP}]'
 ```
@@ -341,7 +341,7 @@ dev-python/httpx:0
 ### Fix
 
 ```bash
-cat > /var/db/repos/pypi/.sys/dependencies-patch/dev-python/open-webui/0.8.5.patch << 'EOF'
+cat > /var/db/repos/pypi/.sys/RDEPEND-patch/dev-python/open-webui/0.8.5.patch << 'EOF'
 # Allow gentoo's httpx revision
 -> =dev-python/httpx-0.28.1[${PYTHON_USEDEP}] >=dev-python/httpx-0.28.1[${PYTHON_USEDEP}]
 # Allow older pillow from gentoo
@@ -449,12 +449,12 @@ touch /var/db/repos/pypi/.sys/iuse/dev-python/gevent/_all/embed_cares
 touch /var/db/repos/pypi/.sys/iuse/dev-python/gevent/_all/embed_libev
 
 # 2. Add build-time dependencies
-touch '/var/db/repos/pypi/.sys/depend/dev-python/gevent/_all/net-dns::c-ares'
-touch '/var/db/repos/pypi/.sys/depend/dev-python/gevent/_all/dev-libs::libev'
+touch '/var/db/repos/pypi/.sys/DEPEND/dev-python/gevent/_all/net-dns::c-ares'
+touch '/var/db/repos/pypi/.sys/DEPEND/dev-python/gevent/_all/dev-libs::libev'
 
 # 3. Add runtime dependencies
-touch '/var/db/repos/pypi/.sys/dependencies/dev-python/gevent/_all/net-dns::c-ares'
-touch '/var/db/repos/pypi/.sys/dependencies/dev-python/gevent/_all/dev-libs::libev'
+touch '/var/db/repos/pypi/.sys/RDEPEND/dev-python/gevent/_all/net-dns::c-ares'
+touch '/var/db/repos/pypi/.sys/RDEPEND/dev-python/gevent/_all/dev-libs::libev'
 
 # 4. Configure build to use system libraries
 echo 'export GEVENTSETUP_EMBED_CARES=0' > \

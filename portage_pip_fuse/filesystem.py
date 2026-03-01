@@ -171,17 +171,16 @@ class PortagePipFS(Operations):
             "/profiles",
             "/metadata",
             "/eclass",
-            # .sys virtual filesystem for dependency patching (RDEPEND)
+            # .sys virtual filesystem for dependency patching
             "/.sys",
-            "/.sys/dependencies",
-            "/.sys/dependencies/dev-python",
-            "/.sys/dependencies-patch",
-            "/.sys/dependencies-patch/dev-python",
-            # .sys virtual filesystem for build dependencies (DEPEND)
-            "/.sys/depend",
-            "/.sys/depend/dev-python",
-            "/.sys/depend-patch",
-            "/.sys/depend-patch/dev-python",
+            "/.sys/RDEPEND",
+            "/.sys/RDEPEND/dev-python",
+            "/.sys/RDEPEND-patch",
+            "/.sys/RDEPEND-patch/dev-python",
+            "/.sys/DEPEND",
+            "/.sys/DEPEND/dev-python",
+            "/.sys/DEPEND-patch",
+            "/.sys/DEPEND-patch/dev-python",
             # .sys virtual filesystem for PYTHON_COMPAT patching
             "/.sys/python-compat",
             "/.sys/python-compat/dev-python",
@@ -398,37 +397,41 @@ cache-formats = md5-dict
 
         Directory structure:
             .sys/
-                dependencies/
+                RDEPEND/
                     dev-python/
                         {package}/
                             {version}/                    # e.g., requests/2.31.0/
                                 >=dev-python/urllib3-1.21[${PYTHON_USEDEP}]  # one file per dep
                             _all/                         # patches apply to all versions
-                dependencies-patch/
+                RDEPEND-patch/
                     dev-python/
                         {package}/
                             {version}.patch               # e.g., 2.31.0.patch
                             _all.patch
+                DEPEND/
+                    ...  # same structure as RDEPEND
+                DEPEND-patch/
+                    ...
         """
         if len(parts) == 1:
             # /.sys
             return {'type': 'sys_root'}
 
-        if parts[1] == 'dependencies':
+        if parts[1] == 'RDEPEND':
             if len(parts) == 2:
-                # /.sys/dependencies
+                # /.sys/RDEPEND
                 return {'type': 'sys_deps'}
             elif len(parts) == 3:
-                # /.sys/dependencies/dev-python
+                # /.sys/RDEPEND/dev-python
                 return {'type': 'sys_deps_category', 'category': parts[2]}
             elif len(parts) == 4:
-                # /.sys/dependencies/dev-python/requests
+                # /.sys/RDEPEND/dev-python/requests
                 return {'type': 'sys_deps_package', 'category': parts[2], 'package': parts[3]}
             elif len(parts) == 5:
-                # /.sys/dependencies/dev-python/requests/2.31.0
+                # /.sys/RDEPEND/dev-python/requests/2.31.0
                 return {'type': 'sys_deps_version', 'category': parts[2], 'package': parts[3], 'version': parts[4]}
             elif len(parts) == 6:
-                # /.sys/dependencies/dev-python/requests/2.31.0/>=dev-python::urllib3-1.21...
+                # /.sys/RDEPEND/dev-python/requests/2.31.0/>=dev-python::urllib3-1.21...
                 # The dep filename has '/' replaced with '::', decode it
                 return {
                     'type': 'sys_deps_dep',
@@ -438,18 +441,18 @@ cache-formats = md5-dict
                     'dep': self._decode_dep_filename(parts[5])
                 }
 
-        elif parts[1] == 'dependencies-patch':
+        elif parts[1] == 'RDEPEND-patch':
             if len(parts) == 2:
-                # /.sys/dependencies-patch
+                # /.sys/RDEPEND-patch
                 return {'type': 'sys_patch'}
             elif len(parts) == 3:
-                # /.sys/dependencies-patch/dev-python
+                # /.sys/RDEPEND-patch/dev-python
                 return {'type': 'sys_patch_category', 'category': parts[2]}
             elif len(parts) == 4:
-                # /.sys/dependencies-patch/dev-python/requests
+                # /.sys/RDEPEND-patch/dev-python/requests
                 return {'type': 'sys_patch_package', 'category': parts[2], 'package': parts[3]}
             elif len(parts) == 5:
-                # /.sys/dependencies-patch/dev-python/requests/2.31.0.patch
+                # /.sys/RDEPEND-patch/dev-python/requests/2.31.0.patch
                 filename = parts[4]
                 if filename.endswith('.patch'):
                     version = filename[:-6]  # Remove .patch
@@ -461,22 +464,21 @@ cache-formats = md5-dict
                         'filename': filename
                     }
 
-        elif parts[1] == 'depend':
-            # Build-time dependencies (DEPEND)
+        elif parts[1] == 'DEPEND':
             if len(parts) == 2:
-                # /.sys/depend
+                # /.sys/DEPEND
                 return {'type': 'sys_depend'}
             elif len(parts) == 3:
-                # /.sys/depend/dev-python
+                # /.sys/DEPEND/dev-python
                 return {'type': 'sys_depend_category', 'category': parts[2]}
             elif len(parts) == 4:
-                # /.sys/depend/dev-python/gevent
+                # /.sys/DEPEND/dev-python/gevent
                 return {'type': 'sys_depend_package', 'category': parts[2], 'package': parts[3]}
             elif len(parts) == 5:
-                # /.sys/depend/dev-python/gevent/25.9.1
+                # /.sys/DEPEND/dev-python/gevent/25.9.1
                 return {'type': 'sys_depend_version', 'category': parts[2], 'package': parts[3], 'version': parts[4]}
             elif len(parts) == 6:
-                # /.sys/depend/dev-python/gevent/25.9.1/net-dns::c-ares
+                # /.sys/DEPEND/dev-python/gevent/25.9.1/net-dns::c-ares
                 return {
                     'type': 'sys_depend_dep',
                     'category': parts[2],
@@ -485,18 +487,18 @@ cache-formats = md5-dict
                     'dep': self._decode_dep_filename(parts[5])
                 }
 
-        elif parts[1] == 'depend-patch':
+        elif parts[1] == 'DEPEND-patch':
             if len(parts) == 2:
-                # /.sys/depend-patch
+                # /.sys/DEPEND-patch
                 return {'type': 'sys_depend_patch'}
             elif len(parts) == 3:
-                # /.sys/depend-patch/dev-python
+                # /.sys/DEPEND-patch/dev-python
                 return {'type': 'sys_depend_patch_category', 'category': parts[2]}
             elif len(parts) == 4:
-                # /.sys/depend-patch/dev-python/gevent
+                # /.sys/DEPEND-patch/dev-python/gevent
                 return {'type': 'sys_depend_patch_package', 'category': parts[2], 'package': parts[3]}
             elif len(parts) == 5:
-                # /.sys/depend-patch/dev-python/gevent/25.9.1.patch
+                # /.sys/DEPEND-patch/dev-python/gevent/25.9.1.patch
                 filename = parts[4]
                 if filename.endswith('.patch'):
                     version = filename[:-6]  # Remove .patch
@@ -1332,8 +1334,22 @@ cache-formats = md5-dict
             # Dependency file in .sys/dependencies/.../version/ or .sys/depend/.../version/
             if self.patch_store is None:
                 raise FuseOSError(errno.ENOENT)
-            # These are virtual files representing dependencies
+            # Check if this dependency patch actually exists
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
             dep_name = parsed['dep']
+            dep_type = 'rdepend' if parsed['type'] == 'sys_deps_dep' else 'depend'
+
+            # Get patches and check if this dep exists as an 'add' patch
+            patches = self.patch_store.get_patches(category, package, version)
+            dep_exists = any(
+                p.operation == 'add' and p.new_dep == dep_name and p.dep_type == dep_type
+                for p in patches
+            )
+            if not dep_exists:
+                raise FuseOSError(errno.ENOENT)
+
             attrs.update({
                 'st_mode': stat.S_IFREG | 0o644,
                 'st_nlink': 1,
@@ -1481,6 +1497,17 @@ cache-formats = md5-dict
             flag = parsed['flag']
             # Reject invalid USE flag names (e.g., vim swap files like .foo.swp)
             if not is_valid_use_flag(flag):
+                raise FuseOSError(errno.ENOENT)
+            # Check if this flag actually exists as an 'add' patch
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+            patches = self.iuse_patch_store.get_patches(category, package, version)
+            flag_exists = any(
+                p.operation == 'add' and p.flag == flag
+                for p in patches
+            )
+            if not flag_exists:
                 raise FuseOSError(errno.ENOENT)
             # USE flag files are just empty files that indicate the flag exists
             attrs.update({
