@@ -157,7 +157,43 @@ cd /var/db/repos/pypi/.sys/dependencies/dev-python/requests/_all/
 rm '=dev-python::old-dep-1.0[${PYTHON_USEDEP}]'
 ```
 
-### Example 5: Export and import patches
+### Example 5: Fix slot conflicts with patch file
+
+When emerge reports slot conflicts between portage-pip-fuse and gentoo packages:
+
+```bash
+# Create patch file to loosen multiple dependencies at once
+cat > /var/db/repos/pypi/.sys/dependencies-patch/dev-python/open-webui/0.8.5.patch << 'EOF'
+# httpx: gentoo has 0.28.1-r1, fuse wants exactly 0.28.1
+-> =dev-python/httpx-0.28.1[${PYTHON_USEDEP}] >=dev-python/httpx-0.28.1[${PYTHON_USEDEP}]
+# pillow: gentoo has 11.3.0, fuse wants 12.1.0
+-> =dev-python/pillow-12.1.0[${PYTHON_USEDEP}] >=dev-python/pillow-11.0[${PYTHON_USEDEP}]
+EOF
+```
+
+### Example 6: Remove upper bound constraint
+
+When a package has an upper bound that conflicts with installed versions:
+
+```bash
+cat > /var/db/repos/pypi/.sys/dependencies-patch/dev-python/youtube-transcript-api/1.2.4.patch << 'EOF'
+# defusedxml: package wants <0.8 but gentoo has 0.8.0_rc2
+-> <dev-python/defusedxml-0.8[${PYTHON_USEDEP}] dev-python/defusedxml[${PYTHON_USEDEP}]
+EOF
+```
+
+### Example 7: Lower minimum version requirement
+
+When a package requires a newer version than what's in gentoo:
+
+```bash
+cat > /var/db/repos/pypi/.sys/dependencies-patch/dev-python/black/26.1.0.patch << 'EOF'
+# pathspec: package wants >=1.0 but gentoo has 0.12.1
+-> >=dev-python/pathspec-1.0[${PYTHON_USEDEP}] >=dev-python/pathspec-0.12[${PYTHON_USEDEP}]
+EOF
+```
+
+### Example 8: Export and import patches
 
 To share patches between systems:
 
@@ -297,7 +333,24 @@ touch '/var/db/repos/pypi/.sys/depend/dev-python/gevent/_all/dev-libs::libev'
 cat /var/db/repos/pypi/dev-python/gevent/gevent-25.9.1.ebuild | grep DEPEND
 ```
 
+## Handling `|| ( )` Groups
+
+When PyPI specifies exact versions, portage-pip-fuse often generates `|| ( )` groups to handle version normalization:
+
+```
+|| ( =dev-python/httpx-0.28.1[${PYTHON_USEDEP}] =dev-python/httpx-0.28.1.0[${PYTHON_USEDEP}] )
+```
+
+**Patches automatically match these groups.** When you write:
+
+```
+-> =dev-python/httpx-0.28.1[${PYTHON_USEDEP}] >=dev-python/httpx-0.28.1[${PYTHON_USEDEP}]
+```
+
+The patch system extracts the package name (`dev-python/httpx`) from the first atom in the `|| ( )` group and replaces the entire group with your new dependency.
+
+This means you don't need to know whether the dependency is a simple atom or an `|| ( )` group - just target the package name and version.
+
 ## Limitations
 
-- Package names in patches must exactly match the generated atom format
 - USE flag conditions are not directly patchable (add/remove entire atoms instead)

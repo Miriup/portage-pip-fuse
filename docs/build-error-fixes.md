@@ -245,13 +245,21 @@ cat /var/db/repos/pypi/dev-python/gevent/gevent-25.9.1.ebuild | grep -E '^DEPEND
 
 ## Runtime Dependency Patches
 
-Use `.sys/dependencies/` when dependency version constraints cause conflicts.
+Use `.sys/dependencies/` or `.sys/dependencies-patch/` when dependency version constraints cause conflicts.
 
 ### Common Symptoms
 
 - `emerge` reports slot conflicts
 - Package requires exact version that conflicts with system
 - Missing dependency not declared by upstream
+- PyPI package pins version but gentoo has different revision (e.g., `0.28.1-r1`)
+
+### Two Interfaces
+
+| Interface | Path | Use When |
+|-----------|------|----------|
+| Browse & modify | `.sys/dependencies/` | Want to see current dependencies |
+| Direct patch file | `.sys/dependencies-patch/` | Prefer direct patch creation, recommended for slot conflicts |
 
 ### Patch Format
 
@@ -261,7 +269,35 @@ Use `.sys/dependencies/` when dependency version constraints cause conflicts.
 ++ new_dep             # Add dependency
 ```
 
-### Examples
+**Note:** Patches automatically match `|| ( )` groups. When portage-pip-fuse generates `|| ( =pkg-1.0 =pkg-1.0.0 )` for version alternatives, a patch targeting `=pkg-1.0` will match and replace the entire group.
+
+### Examples Using Patch File Interface (Recommended)
+
+**Loosen exact version to minimum (fixes revision conflicts):**
+```bash
+cat > /var/db/repos/pypi/.sys/dependencies-patch/dev-python/open-webui/0.8.5.patch << 'EOF'
+# httpx: gentoo has 0.28.1-r1, fuse wants exactly 0.28.1
+-> =dev-python/httpx-0.28.1[${PYTHON_USEDEP}] >=dev-python/httpx-0.28.1[${PYTHON_USEDEP}]
+EOF
+```
+
+**Lower minimum version requirement:**
+```bash
+cat > /var/db/repos/pypi/.sys/dependencies-patch/dev-python/black/26.1.0.patch << 'EOF'
+# pathspec: package wants >=1.0 but gentoo has 0.12.1
+-> >=dev-python/pathspec-1.0[${PYTHON_USEDEP}] >=dev-python/pathspec-0.12[${PYTHON_USEDEP}]
+EOF
+```
+
+**Remove upper bound constraint:**
+```bash
+cat > /var/db/repos/pypi/.sys/dependencies-patch/dev-python/youtube-transcript-api/1.2.4.patch << 'EOF'
+# defusedxml: package wants <0.8 but gentoo has 0.8.0_rc2
+-> <dev-python/defusedxml-0.8[${PYTHON_USEDEP}] dev-python/defusedxml[${PYTHON_USEDEP}]
+EOF
+```
+
+### Examples Using Browse Interface
 
 **Loosen version constraint:**
 ```bash
@@ -278,6 +314,44 @@ rm '=dev-python::unwanted-1.0[${PYTHON_USEDEP}]'
 **Add missing dependency:**
 ```bash
 touch '>=dev-python::missing-dep-1.0[${PYTHON_USEDEP}]'
+```
+
+## Example: Fixing Slot Conflicts
+
+### Error Output
+```
+!!! Multiple package instances within a single package slot have been pulled
+!!! into the dependency graph, resulting in a slot conflict:
+
+dev-python/httpx:0
+
+  (dev-python/httpx-0.28.1-r1:0/0::gentoo, installed) pulled in by
+    >=dev-python/httpx-0.28.0 required by (dev-python/jupyterlab-4.5.1::gentoo)
+
+  (dev-python/httpx-0.28.1:0/0::portage-pip-fuse, scheduled for merge) pulled in by
+    =dev-python/httpx-0.28.1 required by (dev-python/open-webui-0.8.5::portage-pip-fuse)
+```
+
+### Analysis
+
+- **Conflict**: portage-pip-fuse generates `=dev-python/httpx-0.28.1` but gentoo has `0.28.1-r1`
+- **Cause**: PyPI specifies exact version, but Gentoo's revision (`-r1`) doesn't match
+- **Solution**: Loosen the constraint to `>=` so any compatible version works
+
+### Fix
+
+```bash
+cat > /var/db/repos/pypi/.sys/dependencies-patch/dev-python/open-webui/0.8.5.patch << 'EOF'
+# Allow gentoo's httpx revision
+-> =dev-python/httpx-0.28.1[${PYTHON_USEDEP}] >=dev-python/httpx-0.28.1[${PYTHON_USEDEP}]
+# Allow older pillow from gentoo
+-> =dev-python/pillow-12.1.0[${PYTHON_USEDEP}] >=dev-python/pillow-11.0[${PYTHON_USEDEP}]
+EOF
+```
+
+Then re-run:
+```bash
+emerge dev-python/open-webui
 ```
 
 ## Example: psycopg2-2.9.5 Python 3.13 Failure
