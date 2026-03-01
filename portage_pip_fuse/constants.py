@@ -98,3 +98,25 @@ def find_cache_dir(explicit_dir: Optional[str] = None) -> Path:
     raise RuntimeError(
         f"No writable cache directory found. Tried: {', '.join(str(c) for c in CACHE_DIR_CANDIDATES)}"
     )
+
+
+def get_mount_point_key(mount_point: str) -> str:
+    """
+    Convert mount point path to canonical key for configuration.
+
+    This function resolves symlinks and produces an absolute path that
+    can be used as a unique key for mount-point-specific configuration.
+
+    Args:
+        mount_point: The mount point path to canonicalize
+
+    Returns:
+        Canonical absolute path string
+
+    Examples:
+        >>> get_mount_point_key('/var/db/repos/pypi')
+        '/var/db/repos/pypi'
+        >>> get_mount_point_key('/var/db/repos/pypi/')
+        '/var/db/repos/pypi'
+    """
+    return str(Path(mount_point).resolve())

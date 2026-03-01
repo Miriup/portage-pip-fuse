@@ -27,7 +27,12 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
+from .constants import get_mount_point_key
+
 logger = logging.getLogger(__name__)
+
+# Current patch file format version
+PATCH_FILE_VERSION = 3
 
 
 @dataclass
@@ -245,14 +250,26 @@ class DependencyPatchStore:
         >>> import os; os.unlink(f.name)
     """
 
-    def __init__(self, storage_path: Optional[str] = None):
+    def __init__(self, storage_path: Optional[str] = None, mount_point: Optional[str] = None):
         """
         Initialize the patch store.
 
         Args:
             storage_path: Path to JSON file for persistence (None for memory-only)
+            mount_point: Mount point path for namespaced configuration
+
+        Note:
+            WARNING: Race conditions with concurrent mounts
+
+            When multiple FUSE instances share the same patches.json file,
+            concurrent saves may cause one instance's changes to be lost.
+            Each instance reads full file, modifies its section, writes back.
+
+            Mitigation: Each mount point has isolated namespace.
+            For guaranteed isolation: use separate --patch-file per mount.
         """
         self.storage_path = Path(storage_path) if storage_path else None
+        self.mount_point = get_mount_point_key(mount_point) if mount_point else None
         self.patches: Dict[str, PackagePatches] = {}
         self._dirty = False
 
@@ -269,11 +286,24 @@ class DependencyPatchStore:
                 data = json.load(f)
 
             self.patches = {}
-            for item in data.get('patches', []):
-                pp = PackagePatches.from_dict(item)
-                self.patches[pp.key] = pp
+            version = data.get('version', 1)
 
-            logger.info(f"Loaded {len(self.patches)} package patches from {self.storage_path}")
+            if version >= 3 and 'mount_points' in data:
+                # v3 format: mount_points -> {mount_point -> {patches: [...]}}
+                if self.mount_point and self.mount_point in data['mount_points']:
+                    mp_data = data['mount_points'][self.mount_point]
+                    for item in mp_data.get('patches', []):
+                        pp = PackagePatches.from_dict(item)
+                        self.patches[pp.key] = pp
+                # If mount_point not found, we'll have empty patches (new namespace)
+            else:
+                # v1/v2 legacy format: patches at top level
+                for item in data.get('patches', []):
+                    pp = PackagePatches.from_dict(item)
+                    self.patches[pp.key] = pp
+
+            logger.info(f"Loaded {len(self.patches)} package patches from {self.storage_path}"
+                       + (f" (mount: {self.mount_point})" if self.mount_point else ""))
 
         except (json.JSONDecodeError, KeyError, OSError) as e:
             logger.error(f"Failed to load patches from {self.storage_path}: {e}")
@@ -283,8 +313,12 @@ class DependencyPatchStore:
         """
         Save patches to JSON file atomically.
 
-        This method preserves existing data in the file (like python_compat_patches,
-        ebuild_appends, iuse_patches) and only updates the patches section.
+        This method preserves existing data in the file (other mount points,
+        and other patch types like python_compat_patches, ebuild_appends, iuse_patches)
+        and only updates the patches section for this mount point.
+
+        When migrating from v1/v2 to v3 format, existing patches are moved to
+        the current mount point's namespace.
 
         Returns:
             True if save was successful, False otherwise
@@ -314,9 +348,31 @@ class DependencyPatchStore:
                 except (json.JSONDecodeError, OSError):
                     pass
 
-            # Update with our patches
-            existing_data['version'] = existing_data.get('version', 1)
-            existing_data['patches'] = [pp.to_dict() for pp in self.patches.values()]
+            old_version = existing_data.get('version', 1)
+
+            # Migrate to v3 format if needed
+            if old_version < 3:
+                # Move existing patches to mount_points structure
+                existing_data['version'] = PATCH_FILE_VERSION
+                if 'mount_points' not in existing_data:
+                    existing_data['mount_points'] = {}
+                # Legacy data gets assigned to current mount point (or default key)
+                mp_key = self.mount_point or '_default'
+                if mp_key not in existing_data['mount_points']:
+                    existing_data['mount_points'][mp_key] = {}
+                # Move legacy patches to this mount point
+                if 'patches' in existing_data:
+                    existing_data['mount_points'][mp_key]['patches'] = existing_data.pop('patches')
+            else:
+                existing_data['version'] = PATCH_FILE_VERSION
+                if 'mount_points' not in existing_data:
+                    existing_data['mount_points'] = {}
+
+            # Update patches for this mount point
+            mp_key = self.mount_point or '_default'
+            if mp_key not in existing_data['mount_points']:
+                existing_data['mount_points'][mp_key] = {}
+            existing_data['mount_points'][mp_key]['patches'] = [pp.to_dict() for pp in self.patches.values()]
 
             # Write to temporary file first
             temp_path = self.storage_path.with_suffix('.tmp')
@@ -327,7 +383,8 @@ class DependencyPatchStore:
             temp_path.rename(self.storage_path)
             self._dirty = False
 
-            logger.debug(f"Saved {len(self.patches)} package patches to {self.storage_path}")
+            logger.debug(f"Saved {len(self.patches)} package patches to {self.storage_path}"
+                        + (f" (mount: {self.mount_point})" if self.mount_point else ""))
             return True
 
         except OSError as e:

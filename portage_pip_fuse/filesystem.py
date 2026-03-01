@@ -23,7 +23,7 @@ from typing import Optional, Dict, List, Set, Tuple
 
 from fuse import FUSE, FuseOSError, Operations
 
-from .constants import REPO_NAME, DEFAULT_PATCH_FILE
+from .constants import REPO_NAME, DEFAULT_PATCH_FILE, get_mount_point_key
 from .dependency_patch import DependencyPatchStore
 from .ebuild_append_patch import EbuildAppendPatchStore, is_valid_phase_name
 from .iuse_patch import IUSEPatchStore, is_valid_use_flag
@@ -78,7 +78,7 @@ class PortagePipFS(Operations):
     
     def __init__(self, root: str = "/", cache_ttl: int = 3600, cache_dir: Optional[str] = None,
                  filter_config: Optional[Dict] = None, patch_file: Optional[str] = None,
-                 no_patches: bool = False):
+                 no_patches: bool = False, mount_point: Optional[str] = None):
         """
         Initialize the FUSE filesystem.
 
@@ -89,10 +89,12 @@ class PortagePipFS(Operations):
             filter_config: Package filter configuration dictionary
             patch_file: Path to dependency patch file (default: ~/.cache/portage-pip-fuse/patches.json)
             no_patches: If True, disable the dependency patching system entirely
+            mount_point: Mount point path for namespaced configuration
         """
         self.root = root
         self.cache_ttl = cache_ttl
         self.no_patches = no_patches
+        self.mount_point = mount_point
         
         # Content cache: path -> (content, timestamp)
         self._content_cache: Dict[str, Tuple[bytes, float]] = {}
@@ -122,44 +124,45 @@ class PortagePipFS(Operations):
         
         # Initialize dependency patch store
         if not no_patches:
-            if patch_file:
-                self.patch_store = DependencyPatchStore(patch_file)
-            else:
-                self.patch_store = DependencyPatchStore(str(DEFAULT_PATCH_FILE))
-            logger.info(f"Dependency patching enabled, using {self.patch_store.storage_path}")
+            patch_path = patch_file or str(DEFAULT_PATCH_FILE)
+            self.patch_store = DependencyPatchStore(patch_path, mount_point=mount_point)
+            logger.info(f"Dependency patching enabled, using {self.patch_store.storage_path}"
+                       + (f" (mount: {mount_point})" if mount_point else ""))
         else:
             self.patch_store = None
             logger.info("Dependency patching disabled")
 
         # Initialize PYTHON_COMPAT patch store (uses same file as dependency patches)
         if not no_patches:
-            if patch_file:
-                self.compat_patch_store = PythonCompatPatchStore(patch_file)
-            else:
-                self.compat_patch_store = PythonCompatPatchStore(str(DEFAULT_PATCH_FILE))
-            logger.info(f"PYTHON_COMPAT patching enabled, using {self.compat_patch_store.storage_path}")
+            patch_path = patch_file or str(DEFAULT_PATCH_FILE)
+            self.compat_patch_store = PythonCompatPatchStore(patch_path, mount_point=mount_point)
+            logger.info(f"PYTHON_COMPAT patching enabled, using {self.compat_patch_store.storage_path}"
+                       + (f" (mount: {mount_point})" if mount_point else ""))
         else:
             self.compat_patch_store = None
 
         # Initialize ebuild append patch store (uses same file as other patches)
         if not no_patches:
-            if patch_file:
-                self.append_patch_store = EbuildAppendPatchStore(patch_file)
-            else:
-                self.append_patch_store = EbuildAppendPatchStore(str(DEFAULT_PATCH_FILE))
-            logger.info(f"Ebuild append patching enabled, using {self.append_patch_store.storage_path}")
+            patch_path = patch_file or str(DEFAULT_PATCH_FILE)
+            self.append_patch_store = EbuildAppendPatchStore(patch_path, mount_point=mount_point)
+            logger.info(f"Ebuild append patching enabled, using {self.append_patch_store.storage_path}"
+                       + (f" (mount: {mount_point})" if mount_point else ""))
         else:
             self.append_patch_store = None
 
         # Initialize IUSE patch store (uses same file as other patches)
         if not no_patches:
-            if patch_file:
-                self.iuse_patch_store = IUSEPatchStore(patch_file)
-            else:
-                self.iuse_patch_store = IUSEPatchStore(str(DEFAULT_PATCH_FILE))
-            logger.info(f"IUSE patching enabled, using {self.iuse_patch_store.storage_path}")
+            patch_path = patch_file or str(DEFAULT_PATCH_FILE)
+            self.iuse_patch_store = IUSEPatchStore(patch_path, mount_point=mount_point)
+            logger.info(f"IUSE patching enabled, using {self.iuse_patch_store.storage_path}"
+                       + (f" (mount: {mount_point})" if mount_point else ""))
         else:
             self.iuse_patch_store = None
+
+        # Git worktree file content (stored in patches.json under mount point)
+        self._git_file_content: Optional[bytes] = None
+        if not no_patches:
+            self._load_git_file_content()
 
         # Static overlay structure
         self.static_dirs = {
@@ -643,7 +646,89 @@ cache-formats = md5-dict
                         'filename': filename
                     }
 
+        elif parts[1] == '.git':
+            # .sys/.git - git worktree file (NOT a directory)
+            if len(parts) == 2:
+                return {'type': 'sys_git_file'}
+            # .sys/.git/anything else is invalid
+            return {'type': 'invalid'}
+
         return {'type': 'invalid'}
+
+    def _load_git_file_content(self) -> None:
+        """Load .git file content from patches.json for this mount point."""
+        if not self.patch_store or not self.patch_store.storage_path:
+            return
+
+        try:
+            import json
+            if self.patch_store.storage_path.exists():
+                with self.patch_store.storage_path.open('r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+                version = data.get('version', 1)
+                if version >= 3 and 'mount_points' in data:
+                    mp_key = get_mount_point_key(self.mount_point) if self.mount_point else '_default'
+                    if mp_key in data['mount_points']:
+                        git_content = data['mount_points'][mp_key].get('git_file_content')
+                        if git_content:
+                            self._git_file_content = git_content.encode('utf-8')
+        except Exception as e:
+            logger.debug(f"Failed to load .git file content: {e}")
+
+    def _save_git_file_content(self) -> bool:
+        """Save .git file content to patches.json for this mount point."""
+        if not self.patch_store or not self.patch_store.storage_path:
+            return False
+
+        try:
+            import json
+            # Ensure directory exists
+            self.patch_store.storage_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Load existing data
+            existing_data = {}
+            if self.patch_store.storage_path.exists():
+                try:
+                    with self.patch_store.storage_path.open('r', encoding='utf-8') as f:
+                        existing_data = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            # Ensure v3 format with mount_points
+            existing_data['version'] = 3
+            if 'mount_points' not in existing_data:
+                existing_data['mount_points'] = {}
+
+            mp_key = get_mount_point_key(self.mount_point) if self.mount_point else '_default'
+            if mp_key not in existing_data['mount_points']:
+                existing_data['mount_points'][mp_key] = {}
+
+            # Store git file content
+            if self._git_file_content:
+                existing_data['mount_points'][mp_key]['git_file_content'] = self._git_file_content.decode('utf-8')
+            else:
+                # Remove git file content if cleared
+                existing_data['mount_points'][mp_key].pop('git_file_content', None)
+
+            # Write atomically
+            temp_path = self.patch_store.storage_path.with_suffix('.tmp')
+            with temp_path.open('w', encoding='utf-8') as f:
+                json.dump(existing_data, f, indent=2)
+            temp_path.rename(self.patch_store.storage_path)
+
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save .git file content: {e}")
+            return False
+
+    def _get_git_file_content(self) -> Optional[bytes]:
+        """Get .git file content."""
+        return self._git_file_content
+
+    def _set_git_file_content(self, content: bytes) -> None:
+        """Set .git file content."""
+        self._git_file_content = content
 
     def _get_cached_content(self, path: str) -> Optional[bytes]:
         """Get cached content if valid."""
@@ -1416,6 +1501,17 @@ cache-formats = md5-dict
                 'st_nlink': 1,
                 'st_size': len(content.encode('utf-8')),
             })
+        # Handle .sys/.git worktree file
+        elif parsed['type'] == 'sys_git_file':
+            content = self._get_git_file_content()
+            if content is None:
+                # File doesn't exist yet - return ENOENT until created
+                raise FuseOSError(errno.ENOENT)
+            attrs.update({
+                'st_mode': stat.S_IFREG | 0o644,
+                'st_nlink': 1,
+                'st_size': len(content),
+            })
         elif parsed['type'] == 'invalid':
             # Invalid path - return ENOENT
             raise FuseOSError(errno.ENOENT)
@@ -1537,6 +1633,9 @@ cache-formats = md5-dict
                     entries.extend(['ebuild-append', 'ebuild-append-patch'])
                 if self.iuse_patch_store is not None:
                     entries.extend(['iuse', 'iuse-patch'])
+                # Show .git file if it exists (for git worktree support)
+                if self._get_git_file_content() is not None:
+                    entries.append('.git')
 
             elif parsed['type'] == 'sys_deps':
                 # /.sys/dependencies - show categories
@@ -1962,6 +2061,13 @@ cache-formats = md5-dict
             content = self.iuse_patch_store.generate_patch_file(category, package, version).encode('utf-8')
             return content[offset:offset + length]
 
+        # Handle .sys/.git file read
+        elif parsed['type'] == 'sys_git_file':
+            content = self._get_git_file_content()
+            if content is None:
+                raise FuseOSError(errno.ENOENT)
+            return content[offset:offset + length]
+
         try:
             # Try cache
             content = self._get_cached_content(path)
@@ -2016,6 +2122,9 @@ cache-formats = md5-dict
             # Validate USE flag name before allowing open
             if not is_valid_use_flag(parsed['flag']):
                 raise FuseOSError(errno.ENOENT)
+            return 0
+        elif parsed['type'] == 'sys_git_file':
+            # Allow opening .git file
             return 0
 
         logger.debug(f"Cannot open path: {path} (type: {parsed['type']})")
@@ -2625,6 +2734,13 @@ cache-formats = md5-dict
             # Just allow creation - actual content set via write()
             return 0
 
+        if parsed['type'] == 'sys_git_file':
+            # touch /.sys/.git or git worktree add creating the file
+            # Initialize empty content - actual content set via write()
+            self._set_git_file_content(b'')
+            logger.info("Created .sys/.git file for git worktree support")
+            return 0
+
         raise FuseOSError(errno.EROFS)
 
     def unlink(self, path):
@@ -2712,6 +2828,15 @@ cache-formats = md5-dict
             self.iuse_patch_store.unlink_flag(category, package, version, flag)
             self._invalidate_package_cache(category, package)
             logger.info(f"Removed USE flag via rm: {flag} from {category}/{package}/{version}")
+            return
+
+        if parsed['type'] == 'sys_git_file':
+            # rm /.sys/.git - remove git worktree file
+            if self._get_git_file_content() is None:
+                raise FuseOSError(errno.ENOENT)
+            self._set_git_file_content(None)
+            self._save_git_file_content()
+            logger.info("Removed .sys/.git file")
             return
 
         raise FuseOSError(errno.EROFS)
@@ -2862,6 +2987,16 @@ cache-formats = md5-dict
 
             return len(data)
 
+        if parsed['type'] == 'sys_git_file':
+            # git worktree writes .git file content like "gitdir: /path/to/.git/worktrees/name"
+            content = data.decode('utf-8', errors='replace').strip()
+            if not content.startswith('gitdir:'):
+                logger.warning(f"Invalid .git file content (expected 'gitdir: ...'): {content[:50]}")
+            self._set_git_file_content(data)
+            self._save_git_file_content()
+            logger.info(f"Wrote .git file content: {content[:50]}...")
+            return len(data)
+
         raise FuseOSError(errno.EROFS)
 
     def truncate(self, path, length, fh=None):
@@ -2943,6 +3078,33 @@ cache-formats = md5-dict
                 self._invalidate_package_cache(category, package)
             return
 
+        if parsed['type'] == 'sys_git_file':
+            # Support truncate for .git file
+            if length == 0:
+                self._set_git_file_content(b'')
+                self._save_git_file_content()
+            return
+
+        raise FuseOSError(errno.EROFS)
+
+    def mkdir(self, path, mode):
+        """
+        Handle mkdir - deny .sys/.git with helpful message.
+
+        This prevents `git init` from creating .sys/.git as a directory.
+        Users should use `git worktree add` instead, which creates .git as a file.
+        """
+        parsed = self._parse_path(path)
+
+        if parsed['type'] == 'sys_git_file':
+            # Attempted mkdir .sys/.git - this would be git init trying to create a repo
+            logger.warning(
+                "Attempted mkdir .sys/.git - use 'git worktree add' instead of 'git init'. "
+                "Create a repo elsewhere and use: git worktree add /mountpoint/.sys <branch>"
+            )
+            raise FuseOSError(errno.EPERM)
+
+        # All other mkdir attempts fail - this is a read-only filesystem
         raise FuseOSError(errno.EROFS)
 
 
@@ -2976,7 +3138,8 @@ def mount_filesystem(mountpoint: str, foreground: bool = False, debug: bool = Fa
         cache_dir=cache_dir,
         filter_config=filter_config,
         patch_file=patch_file,
-        no_patches=no_patches
+        no_patches=no_patches,
+        mount_point=mountpoint
     )
     # Note: nothreads=False allows better signal handling for Ctrl+C
     FUSE(fs, mountpoint, nothreads=False, foreground=foreground, debug=debug, allow_other=True)
