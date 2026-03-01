@@ -1485,6 +1485,18 @@ cache-formats = md5-dict
             if self.compat_patch_store is None:
                 raise FuseOSError(errno.ENOENT)
             impl_name = parsed['impl']
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+            # Check if impl actually exists in PYTHON_COMPAT (original + patches)
+            # If not, return ENOENT so touch will call create() to add a patch
+            pypi_name = self._gentoo_to_pypi(package)
+            if pypi_name:
+                current_impls = self._get_package_python_compat_for_sys(
+                    category, package, pypi_name, version
+                )
+                if impl_name not in current_impls:
+                    raise FuseOSError(errno.ENOENT)
             attrs.update({
                 'st_mode': stat.S_IFREG | 0o644,
                 'st_nlink': 1,
