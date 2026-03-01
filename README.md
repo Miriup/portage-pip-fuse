@@ -264,8 +264,8 @@ The `.sys/` virtual filesystem allows runtime modification of generated ebuilds:
 
 | Directory | Purpose |
 |-----------|---------|
-| `.sys/dependencies/` | Modify runtime dependencies (RDEPEND) |
-| `.sys/depend/` | Add build-time dependencies (DEPEND) |
+| `.sys/RDEPEND/` | Modify runtime dependencies (RDEPEND) |
+| `.sys/DEPEND/` | Add build-time dependencies (DEPEND) |
 | `.sys/python-compat/` | Adjust Python version compatibility |
 | `.sys/iuse/` | Add/remove USE flags |
 | `.sys/ebuild-append/` | Add custom phase functions |
@@ -277,7 +277,7 @@ The `.sys/` virtual filesystem allows runtime modification of generated ebuilds:
 echo '-- python3_13' > /var/db/repos/pypi/.sys/python-compat-patch/dev-python/oldpkg/_all.patch
 
 # Add missing dependency
-touch '/var/db/repos/pypi/.sys/dependencies/dev-python/broken-pkg/_all/>=dev-python::missing-1.0'
+touch '/var/db/repos/pypi/.sys/RDEPEND/dev-python/broken-pkg/_all/>=dev-python::missing-1.0'
 
 # Add custom src_configure
 echo 'export MY_VAR=1' > /var/db/repos/pypi/.sys/ebuild-append/dev-python/pkg/_all/src_configure

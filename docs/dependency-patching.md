@@ -19,20 +19,20 @@ The patching system exposes a `.sys/` virtual filesystem at the repository root:
 
 ```
 /var/db/repos/pypi/.sys/
-    dependencies/
+    RDEPEND/
         dev-python/
             {package}/
                 {version}/                    # e.g., requests/2.31.0/
                     >=dev-python/urllib3-1.21[${PYTHON_USEDEP}]  # one file per dep
                 _all/                         # patches apply to all versions
-    dependencies-patch/
+    RDEPEND-patch/
         dev-python/
             {package}/
                 {version}.patch               # e.g., 2.31.0.patch
                 _all.patch
 ```
 
-### dependencies/
+### RDEPEND/
 
 This directory shows dependencies for each package version. Each dependency appears as a file whose name is the dependency atom with `/` replaced by `::`.
 
@@ -43,7 +43,7 @@ For example, `>=dev-python/urllib3-1.21[${PYTHON_USEDEP}]` becomes:
 - Dependencies shown reflect original deps with patches applied
 - Use shell quoting when working with these filenames (they contain `$`, `[`, `]`)
 
-### dependencies-patch/
+### RDEPEND-patch/
 
 This directory contains patch files in a portable text format. These can be exported, shared, and imported on other systems.
 
@@ -106,7 +106,7 @@ portage-pip-fuse mount --no-patches
 The `requests` package often pins an exact urllib3 version. To allow any compatible version:
 
 ```bash
-cd /var/db/repos/pypi/.sys/dependencies/dev-python/requests/2.31.0/
+cd /var/db/repos/pypi/.sys/RDEPEND/dev-python/requests/2.31.0/
 
 # List current dependencies (/ shown as ::)
 ls
@@ -126,7 +126,7 @@ cat /var/db/repos/pypi/dev-python/requests/requests-2.31.0.ebuild | grep urllib3
 Some packages declare optional dependencies as required. To remove one:
 
 ```bash
-cd /var/db/repos/pypi/.sys/dependencies/dev-python/problematic-pkg/1.0.0/
+cd /var/db/repos/pypi/.sys/RDEPEND/dev-python/problematic-pkg/1.0.0/
 
 # List deps to find the one to remove
 ls
@@ -140,7 +140,7 @@ rm '=dev-python::unwanted-dep-1.0[${PYTHON_USEDEP}]'
 If upstream forgot to declare a dependency:
 
 ```bash
-cd /var/db/repos/pypi/.sys/dependencies/dev-python/incomplete-pkg/1.0.0/
+cd /var/db/repos/pypi/.sys/RDEPEND/dev-python/incomplete-pkg/1.0.0/
 
 # Add the missing dependency (use :: instead of /)
 touch '>=dev-python::missing-dep-1.0[${PYTHON_USEDEP}]'
@@ -151,7 +151,7 @@ touch '>=dev-python::missing-dep-1.0[${PYTHON_USEDEP}]'
 To apply the same patch to all versions of a package:
 
 ```bash
-cd /var/db/repos/pypi/.sys/dependencies/dev-python/requests/_all/
+cd /var/db/repos/pypi/.sys/RDEPEND/dev-python/requests/_all/
 
 # Remove a deprecated dependency from all versions
 rm '=dev-python::old-dep-1.0[${PYTHON_USEDEP}]'
@@ -163,10 +163,10 @@ To share patches between systems:
 
 ```bash
 # Export patches
-cat /var/db/repos/pypi/.sys/dependencies-patch/dev-python/requests/2.31.0.patch > ~/requests-patches.txt
+cat /var/db/repos/pypi/.sys/RDEPEND-patch/dev-python/requests/2.31.0.patch > ~/requests-patches.txt
 
 # Import on another system
-cat ~/requests-patches.txt > /var/db/repos/pypi/.sys/dependencies-patch/dev-python/requests/2.31.0.patch
+cat ~/requests-patches.txt > /var/db/repos/pypi/.sys/RDEPEND-patch/dev-python/requests/2.31.0.patch
 ```
 
 ## Persistence
@@ -250,7 +250,7 @@ Patches are stored in JSON:
 ### Data Flow
 
 ```
-User file operation in .sys/dependencies/
+User file operation in .sys/RDEPEND/
     |
     v
 FUSE: rename/unlink/create
@@ -267,17 +267,17 @@ Portage reads ebuild --> _generate_ebuild() --> apply_patches() --> RDEPEND
 
 ## Build-Time Dependencies (DEPEND)
 
-In addition to runtime dependencies (RDEPEND), you can also patch build-time dependencies using `.sys/depend/`:
+In addition to runtime dependencies (RDEPEND), you can also patch build-time dependencies using `.sys/DEPEND/`:
 
 ```
 /var/db/repos/pypi/.sys/
-    depend/
+    DEPEND/
         dev-python/
             {package}/
                 {version}/
                     net-dns::c-ares          # Build-time dependency
                 _all/
-    depend-patch/
+    DEPEND-patch/
         dev-python/
             {package}/
                 {version}.patch
@@ -290,8 +290,8 @@ gevent needs c-ares and libev development headers at build time:
 
 ```bash
 # Add build-time dependencies
-touch '/var/db/repos/pypi/.sys/depend/dev-python/gevent/_all/net-dns::c-ares'
-touch '/var/db/repos/pypi/.sys/depend/dev-python/gevent/_all/dev-libs::libev'
+touch '/var/db/repos/pypi/.sys/DEPEND/dev-python/gevent/_all/net-dns::c-ares'
+touch '/var/db/repos/pypi/.sys/DEPEND/dev-python/gevent/_all/dev-libs::libev'
 
 # Verify in the ebuild
 cat /var/db/repos/pypi/dev-python/gevent/gevent-25.9.1.ebuild | grep DEPEND

@@ -8,9 +8,9 @@ When packages fail to build, you can use the `.sys/` virtual filesystem to patch
 |------------|-------------------|
 | Python API incompatibility | `.sys/python-compat/` |
 | Missing/wrong Python version | `.sys/python-compat/` |
-| Runtime dependency conflict | `.sys/dependencies/` |
-| Missing runtime dependency | `.sys/dependencies/` |
-| Missing build dependency | `.sys/depend/` |
+| Runtime dependency conflict | `.sys/RDEPEND/` |
+| Missing runtime dependency | `.sys/RDEPEND/` |
+| Missing build dependency | `.sys/DEPEND/` |
 | Missing USE flags | `.sys/iuse/` |
 | Custom build phase needed | `.sys/ebuild-append/` |
 
@@ -212,7 +212,7 @@ distutils-r1_src_configure
 
 ## Build-Time Dependencies (DEPEND)
 
-Use `.sys/depend/` when a package needs build-time dependencies (headers, libraries for compilation).
+Use `.sys/DEPEND/` when a package needs build-time dependencies (headers, libraries for compilation).
 
 ### Common Symptoms
 
@@ -223,7 +223,7 @@ Use `.sys/depend/` when a package needs build-time dependencies (headers, librar
 ### Directory Structure
 
 ```
-.sys/depend/
+.sys/DEPEND/
     dev-python/
         {package}/
             {version}/
@@ -236,8 +236,8 @@ Use `.sys/depend/` when a package needs build-time dependencies (headers, librar
 **Add build dependencies for gevent:**
 ```bash
 # gevent needs c-ares and libev headers to build against system libraries
-touch '/var/db/repos/pypi/.sys/depend/dev-python/gevent/_all/net-dns::c-ares'
-touch '/var/db/repos/pypi/.sys/depend/dev-python/gevent/_all/dev-libs::libev'
+touch '/var/db/repos/pypi/.sys/DEPEND/dev-python/gevent/_all/net-dns::c-ares'
+touch '/var/db/repos/pypi/.sys/DEPEND/dev-python/gevent/_all/dev-libs::libev'
 
 # Verify
 cat /var/db/repos/pypi/dev-python/gevent/gevent-25.9.1.ebuild | grep -E '^DEPEND='
@@ -245,7 +245,7 @@ cat /var/db/repos/pypi/dev-python/gevent/gevent-25.9.1.ebuild | grep -E '^DEPEND
 
 ## Runtime Dependency Patches
 
-Use `.sys/dependencies/` when dependency version constraints cause conflicts.
+Use `.sys/RDEPEND/` when dependency version constraints cause conflicts.
 
 ### Common Symptoms
 
@@ -265,7 +265,7 @@ Use `.sys/dependencies/` when dependency version constraints cause conflicts.
 
 **Loosen version constraint:**
 ```bash
-cd /var/db/repos/pypi/.sys/dependencies/dev-python/{package}/{version}/
+cd /var/db/repos/pypi/.sys/RDEPEND/dev-python/{package}/{version}/
 mv '=dev-python::urllib3-1.26.0[${PYTHON_USEDEP}]' \
    '>=dev-python::urllib3-1.26.0[${PYTHON_USEDEP}]'
 ```
@@ -375,12 +375,12 @@ touch /var/db/repos/pypi/.sys/iuse/dev-python/gevent/_all/embed_cares
 touch /var/db/repos/pypi/.sys/iuse/dev-python/gevent/_all/embed_libev
 
 # 2. Add build-time dependencies
-touch '/var/db/repos/pypi/.sys/depend/dev-python/gevent/_all/net-dns::c-ares'
-touch '/var/db/repos/pypi/.sys/depend/dev-python/gevent/_all/dev-libs::libev'
+touch '/var/db/repos/pypi/.sys/DEPEND/dev-python/gevent/_all/net-dns::c-ares'
+touch '/var/db/repos/pypi/.sys/DEPEND/dev-python/gevent/_all/dev-libs::libev'
 
 # 3. Add runtime dependencies
-touch '/var/db/repos/pypi/.sys/dependencies/dev-python/gevent/_all/net-dns::c-ares'
-touch '/var/db/repos/pypi/.sys/dependencies/dev-python/gevent/_all/dev-libs::libev'
+touch '/var/db/repos/pypi/.sys/RDEPEND/dev-python/gevent/_all/net-dns::c-ares'
+touch '/var/db/repos/pypi/.sys/RDEPEND/dev-python/gevent/_all/dev-libs::libev'
 
 # 4. Configure build to use system libraries
 echo 'export GEVENTSETUP_EMBED_CARES=0' > \
