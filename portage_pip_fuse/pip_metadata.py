@@ -421,7 +421,61 @@ class PyPIMetadataExtractor:
                 return download
         
         return None
-    
+
+    def get_wheel_distribution(self, downloads: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Find a pure-Python wheel from download list.
+
+        Only returns wheels tagged 'py3-none-any' or 'py2.py3-none-any' which
+        are pure Python wheels with no platform dependencies. These are usable
+        on Gentoo since they don't require pre-built binary extensions.
+
+        Args:
+            downloads: List of download info dictionaries
+
+        Returns:
+            Wheel distribution info or None if no suitable wheel found
+
+        Examples:
+            >>> extractor = PyPIMetadataExtractor()
+            >>> downloads = [
+            ...     {'packagetype': 'bdist_wheel', 'filename': 'example-1.0-py3-none-any.whl'},
+            ...     {'packagetype': 'sdist', 'filename': 'example-1.0.tar.gz'}
+            ... ]
+            >>> wheel = extractor.get_wheel_distribution(downloads)
+            >>> wheel['filename']
+            'example-1.0-py3-none-any.whl'
+            >>> # Test preference for py3-none-any over py2.py3-none-any
+            >>> downloads = [
+            ...     {'packagetype': 'bdist_wheel', 'filename': 'example-1.0-py2.py3-none-any.whl'},
+            ...     {'packagetype': 'bdist_wheel', 'filename': 'example-1.0-py3-none-any.whl'}
+            ... ]
+            >>> wheel = extractor.get_wheel_distribution(downloads)
+            >>> wheel['filename']
+            'example-1.0-py3-none-any.whl'
+            >>> # Platform-specific wheels should not be returned
+            >>> downloads = [
+            ...     {'packagetype': 'bdist_wheel', 'filename': 'example-1.0-cp311-cp311-manylinux_2_17_x86_64.whl'}
+            ... ]
+            >>> extractor.get_wheel_distribution(downloads) is None
+            True
+        """
+        # Prefer py3-none-any (pure Python 3 only) over py2.py3-none-any
+        for download in downloads:
+            if download.get('packagetype') == 'bdist_wheel':
+                filename = download.get('filename', '')
+                if filename.endswith('-py3-none-any.whl'):
+                    return download
+
+        # Fall back to py2.py3-none-any
+        for download in downloads:
+            if download.get('packagetype') == 'bdist_wheel':
+                filename = download.get('filename', '')
+                if filename.endswith('-py2.py3-none-any.whl'):
+                    return download
+
+        return None
+
     def _normalize_sdist_filename(self, filename: str) -> str:
         """
         Normalize sdist filename according to PEP 625 rules.
@@ -855,7 +909,24 @@ class PyPIMetadataExtractor:
         # Extract all information
         downloads = self.extract_download_info(package_json)
         metadata = self.get_package_metadata(package_json)
+
+        # Try sdist first, fall back to pure-Python wheel
         sdist = self.get_source_distribution(downloads)
+        wheel_dist = None
+        use_wheel = False
+
+        if sdist:
+            dist_info = sdist
+        else:
+            # Fall back to pure-Python wheel
+            wheel_dist = self.get_wheel_distribution(downloads)
+            if wheel_dist:
+                dist_info = wheel_dist
+                use_wheel = True
+                logger.debug(f"Using wheel for {package_name}: {wheel_dist.get('filename')}")
+            else:
+                # No usable distribution - package will not be visible
+                dist_info = None
         
         # Parse Python versions from classifiers first
         classifier_versions = self.extract_python_versions(metadata.get('classifiers', []))
@@ -896,19 +967,21 @@ class PyPIMetadataExtractor:
             python_versions = []
 
         runtime_deps, optional_deps = self.parse_dependencies(metadata.get('dependencies', []))
-        
+
         complete_info = {
             'metadata': metadata,
             'downloads': downloads,
             'source_distribution': sdist,
+            'wheel_distribution': wheel_dist,
+            'use_wheel': use_wheel,
             'python_versions': python_versions,
             'runtime_dependencies': runtime_deps,
             'optional_dependencies': optional_deps,
         }
-        
-        # Generate Manifest entry if we have source distribution
-        if sdist:
-            manifest_entry = self.generate_manifest_entry(sdist)
+
+        # Generate Manifest entry for whichever distribution we have
+        if dist_info:
+            manifest_entry = self.generate_manifest_entry(dist_info)
             complete_info['manifest_entry'] = manifest_entry
         
         # Cache the complete information
@@ -1812,26 +1885,43 @@ class EbuildDataExtractor:
             return {}
 
         metadata = package_info.get('metadata', {})
-
-        # Extract original PyPI project name from sdist filename
-        # PyPI normalizes the 'name' field but keeps original case in filenames
-        # e.g., name="pillow" but filename="Pillow-9.4.0.tar.gz"
-        sdist = package_info.get('source_distribution') or {}
-        sdist_filename = sdist.get('filename', '')
+        use_wheel = package_info.get('use_wheel', False)
         version = metadata.get('version', '')
 
-        # Extract project name from filename: {project}-{version}.tar.gz
+        # Extract original PyPI project name from distribution filename
+        # PyPI normalizes the 'name' field but keeps original case in filenames
+        # e.g., name="pillow" but filename="Pillow-9.4.0.tar.gz"
         pypi_pn = metadata.get('name', '')  # fallback to normalized name
-        if sdist_filename and version:
-            # Remove version and extension to get original project name
-            suffix = f'-{version}.tar.gz'
-            if sdist_filename.endswith(suffix):
-                pypi_pn = sdist_filename[:-len(suffix)]
-            else:
-                # Try .zip
-                suffix = f'-{version}.zip'
+
+        if use_wheel:
+            # Extract from wheel filename: {project}-{version}-{pytag}-{abi}-{platform}.whl
+            wheel_dist = package_info.get('wheel_distribution') or {}
+            wheel_filename = wheel_dist.get('filename', '')
+            if wheel_filename and version:
+                # Wheel filenames have the format: name-version-pytag-abi-platform.whl
+                # The name part uses underscores instead of hyphens/dots
+                parts = wheel_filename.split('-')
+                if len(parts) >= 5:  # name-version-pytag-abi-platform.whl
+                    # Name might contain underscores, so we need to find where version starts
+                    # Version should match what we have
+                    for i in range(1, len(parts)):
+                        if parts[i] == version.replace('-', '_'):
+                            pypi_pn = '-'.join(parts[:i]).replace('_', '-')
+                            break
+        else:
+            # Extract from sdist filename: {project}-{version}.tar.gz
+            sdist = package_info.get('source_distribution') or {}
+            sdist_filename = sdist.get('filename', '')
+            if sdist_filename and version:
+                # Remove version and extension to get original project name
+                suffix = f'-{version}.tar.gz'
                 if sdist_filename.endswith(suffix):
                     pypi_pn = sdist_filename[:-len(suffix)]
+                else:
+                    # Try .zip
+                    suffix = f'-{version}.zip'
+                    if sdist_filename.endswith(suffix):
+                        pypi_pn = sdist_filename[:-len(suffix)]
 
         ebuild_data = {
             # Basic package information
@@ -1849,20 +1939,32 @@ class EbuildDataExtractor:
             'PYTHON_COMPAT': self.format_python_compat(
                 package_info.get('python_versions', [])
             ),
-            
+
             # Dependencies - pure Python packages only need runtime deps
             'DEPEND': [],  # No build-time deps for pure Python
             'RDEPEND': self.format_dependencies(
                 package_info.get('runtime_dependencies', [])
             ),
-            
-            # Source information
-            'SRC_URI': (package_info.get('source_distribution') or {}).get('url', ''),
-            
+
+            # Source information - use wheel URL if no sdist
+            'SRC_URI': '',  # Will be set below
+
+            # Wheel support
+            'use_wheel': use_wheel,
+
             # Additional metadata
             'KEYWORDS': 'amd64 x86',  # Stable keywords - PyPI packages are generally stable releases
             'SLOT': '0',
         }
+
+        # Set SRC_URI based on distribution type
+        if use_wheel:
+            wheel_dist = package_info.get('wheel_distribution') or {}
+            ebuild_data['SRC_URI'] = wheel_dist.get('url', '')
+            ebuild_data['wheel_filename'] = wheel_dist.get('filename', '')
+        else:
+            sdist = package_info.get('source_distribution') or {}
+            ebuild_data['SRC_URI'] = sdist.get('url', '')
         
         # Handle PyPI extras as USE flags
         optional_deps = package_info.get('optional_dependencies', [])

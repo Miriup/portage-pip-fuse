@@ -2177,35 +2177,76 @@ cache-formats = md5-dict
 
     def _format_ebuild(self, data: dict, category: str = 'dev-python',
                        package: str = '', version: str = '') -> str:
-        """Format ebuild data into ebuild file content."""
+        """Format ebuild data into ebuild file content.
+
+        Handles both sdist-based and wheel-based ebuilds. Wheel-based ebuilds
+        are generated when a package has no sdist but has a pure-Python wheel.
+        """
+        use_wheel = data.get('use_wheel', False)
+        python_compat = ' '.join(data.get('PYTHON_COMPAT', ['python3_11', 'python3_12', 'python3_13']))
+
         ebuild_lines = [
             f"# Copyright 2026 Gentoo Authors",
             f"# Distributed under the terms of the GNU General Public License v2",
             f"",
             f"EAPI=8",
             f"",
-            f"DISTUTILS_USE_PEP517=setuptools",
-            f"PYTHON_COMPAT=( {' '.join(data.get('PYTHON_COMPAT', ['python3_11', 'python3_12', 'python3_13']))} )",
-            f"# PYPI_* variables must be set before inherit",
-            f"PYPI_NO_NORMALIZE=1",
-            f"PYPI_PN=\"{data.get('PYPI_PN', data.get('PN', ''))}\"",
-            f"PYPI_PV=\"{data.get('PYPI_PV', data.get('PV', ''))}\"",
-            f"",
-            f"inherit distutils-r1 pypi",
-            f"",
-            f"DESCRIPTION=\"{self._escape_double_quotes(data.get('DESCRIPTION', 'Python package from PyPI'))}\"",
-            f"HOMEPAGE=\"{data.get('HOMEPAGE', 'https://pypi.org/project/' + data.get('PN', ''))}\"",
-            f"",
-            f"LICENSE=\"{data.get('LICENSE', 'unknown')}\"",
-            f"SLOT=\"{data.get('SLOT', '0')}\"",
-            f"KEYWORDS=\"{data.get('KEYWORDS', '~amd64 ~x86')}\"",
         ]
-        
+
+        if use_wheel:
+            # Wheel-based ebuild - no pypi eclass, explicit SRC_URI
+            wheel_filename = data.get('wheel_filename', '')
+            wheel_url = data.get('SRC_URI', '')
+
+            ebuild_lines.extend([
+                f"PYTHON_COMPAT=( {python_compat} )",
+                f"",
+                f"inherit python-r1",
+                f"",
+                f"DESCRIPTION=\"{self._escape_double_quotes(data.get('DESCRIPTION', 'Python package from PyPI'))}\"",
+                f"HOMEPAGE=\"{data.get('HOMEPAGE', 'https://pypi.org/project/' + data.get('PN', ''))}\"",
+                f"",
+                f"# Wheel archive - renamed to .zip for extraction",
+                f"SRC_URI=\"{wheel_url}\"",
+                f"S=\"${{WORKDIR}}\"",
+                f"",
+                f"LICENSE=\"{data.get('LICENSE', 'unknown')}\"",
+                f"SLOT=\"{data.get('SLOT', '0')}\"",
+                f"KEYWORDS=\"{data.get('KEYWORDS', '~amd64 ~x86')}\"",
+                f"REQUIRED_USE=\"${{PYTHON_REQUIRED_USE}}\"",
+            ])
+        else:
+            # Sdist-based ebuild - use pypi eclass
+            ebuild_lines.extend([
+                f"DISTUTILS_USE_PEP517=setuptools",
+                f"PYTHON_COMPAT=( {python_compat} )",
+                f"# PYPI_* variables must be set before inherit",
+                f"PYPI_NO_NORMALIZE=1",
+                f"PYPI_PN=\"{data.get('PYPI_PN', data.get('PN', ''))}\"",
+                f"PYPI_PV=\"{data.get('PYPI_PV', data.get('PV', ''))}\"",
+                f"",
+                f"inherit distutils-r1 pypi",
+                f"",
+                f"DESCRIPTION=\"{self._escape_double_quotes(data.get('DESCRIPTION', 'Python package from PyPI'))}\"",
+                f"HOMEPAGE=\"{data.get('HOMEPAGE', 'https://pypi.org/project/' + data.get('PN', ''))}\"",
+                f"",
+                f"LICENSE=\"{data.get('LICENSE', 'unknown')}\"",
+                f"SLOT=\"{data.get('SLOT', '0')}\"",
+                f"KEYWORDS=\"{data.get('KEYWORDS', '~amd64 ~x86')}\"",
+            ])
+
         # Add IUSE for PyPI extras as USE flags
         if data.get('IUSE'):
             ebuild_lines.append(f"")
             ebuild_lines.append(f"IUSE=\"{' '.join(data['IUSE'])}\"")
-        
+
+        # Add BDEPEND for wheel-based ebuilds (need unzip)
+        if use_wheel:
+            ebuild_lines.append(f"")
+            ebuild_lines.append(f"BDEPEND=\"")
+            ebuild_lines.append(f"\tapp-arch/unzip")
+            ebuild_lines.append(f"\t${{PYTHON_DEPS}}\"")
+
         # Add dependencies if present
         if data.get('DEPEND'):
             ebuild_lines.append(f"")
@@ -2213,14 +2254,21 @@ cache-formats = md5-dict
             for dep in data['DEPEND']:
                 ebuild_lines.append(f"\t{dep}")
             ebuild_lines.append(f"\"")
-            
+
         if data.get('RDEPEND'):
             ebuild_lines.append(f"")
-            ebuild_lines.append(f"RDEPEND=\"")
+            rdepend_var = "RDEPEND" if not use_wheel else "RDEPEND"
+            ebuild_lines.append(f"{rdepend_var}=\"")
+            if use_wheel:
+                ebuild_lines.append(f"\t${{PYTHON_DEPS}}")
             for dep in data['RDEPEND']:
                 ebuild_lines.append(f"\t{dep}")
             ebuild_lines.append(f"\"")
-            
+        elif use_wheel:
+            # Wheel ebuilds always need PYTHON_DEPS in RDEPEND
+            ebuild_lines.append(f"")
+            ebuild_lines.append(f"RDEPEND=\"${{PYTHON_DEPS}}\"")
+
         # Add optional dependencies with USE flags (grouped properly per Gentoo style)
         if data.get('OPTIONAL_DEPEND'):
             ebuild_lines.append(f"")
@@ -2230,6 +2278,35 @@ cache-formats = md5-dict
                     deps_str = ' '.join(deps)
                     ebuild_lines.append(f"\t{use_flag}? ( {deps_str} )")
             ebuild_lines.append(f"\"")
+
+        # Add wheel-specific functions
+        if use_wheel:
+            wheel_filename = data.get('wheel_filename', '')
+            # Extract the package directory name from the wheel (e.g., "mypackage" or "mypackage-1.0.dist-info")
+            ebuild_lines.extend([
+                f"",
+                f"src_unpack() {{",
+                f"\tdefault",
+                f"\t# Wheel files are zip archives",
+                f"\tcd \"${{WORKDIR}}\" || die",
+                f"\tunzip -q \"${{DISTDIR}}/{wheel_filename}\" || die",
+                f"}}",
+                f"",
+                f"src_configure() {{ :; }}",
+                f"src_compile() {{ :; }}",
+                f"",
+                f"src_install() {{",
+                f"\tpython_foreach_impl python_domodule *.py",
+                f"\t# Install package directories",
+                f"\tlocal dir",
+                f"\tfor dir in */ ; do",
+                f"\t\t[[ -d \"${{dir}}\" ]] || continue",
+                f"\t\t[[ \"${{dir}}\" == *.dist-info/ ]] && continue",
+                f"\t\t[[ \"${{dir}}\" == *.data/ ]] && continue",
+                f"\t\tpython_foreach_impl python_domodule \"${{dir%/}}\"",
+                f"\tdone",
+                f"}}",
+            ])
 
         # Apply ebuild phase appends from .sys/ebuild-append/ if available
         if self.append_patch_store is not None and package and version:
