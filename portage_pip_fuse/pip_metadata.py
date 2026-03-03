@@ -1614,8 +1614,9 @@ class EbuildDataExtractor:
         """
         Add ${PYTHON_USEDEP} to a Gentoo dependency string.
 
-        Handles both simple atoms and || ( ) groups by adding the USEDEP
-        to each individual atom.
+        Handles simple atoms, || ( ) groups, and space-separated compound
+        atoms (e.g., '>=pkg-1.0 <pkg-2.0') by adding the USEDEP to each
+        individual atom.
 
         Args:
             dep: Gentoo dependency string
@@ -1631,6 +1632,8 @@ class EbuildDataExtractor:
             '|| ( =dev-python/foo-1.0[${PYTHON_USEDEP}] =dev-python/foo-1.0.0[${PYTHON_USEDEP}] )'
             >>> extractor._add_python_usedep('dev-python/simple')
             'dev-python/simple[${PYTHON_USEDEP}]'
+            >>> extractor._add_python_usedep('>=dev-python/foo-1.0 <dev-python/foo-2.0')
+            '>=dev-python/foo-1.0[${PYTHON_USEDEP}] <dev-python/foo-2.0[${PYTHON_USEDEP}]'
         """
         usedep = '[${PYTHON_USEDEP}]'
 
@@ -1641,6 +1644,15 @@ class EbuildDataExtractor:
             atoms = inner.split()
             atoms_with_usedep = [f"{atom}{usedep}" for atom in atoms]
             return f"|| ( {' '.join(atoms_with_usedep)} )"
+
+        # Handle space-separated compound atoms (e.g., '>=pkg-1.0 <pkg-2.0')
+        # Check if this looks like multiple atoms (contains space and multiple category/package refs)
+        if ' ' in dep and not dep.startswith('|| '):
+            atoms = dep.split()
+            # Verify each part looks like an atom (contains /)
+            if all('/' in atom for atom in atoms):
+                atoms_with_usedep = [f"{atom}{usedep}" for atom in atoms]
+                return ' '.join(atoms_with_usedep)
 
         # Simple atom - just append USEDEP
         return f"{dep}{usedep}"
