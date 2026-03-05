@@ -173,3 +173,8 @@ auto-save-list
 *.bak
 *.tmp
 .*.tmp
+
+# Pathes
+*.orig
+*.rej
+
