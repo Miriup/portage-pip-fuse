@@ -673,7 +673,11 @@ Supported sections:
 
 ### RubyGems Name Translation
 
-Gem names are translated to Gentoo package names:
+Gem names are translated to Gentoo package names. Underscores are **preserved** (they're valid per PMS 3.1.2) to distinguish gems like:
+- `devise-secure_password` (underscore) → `dev-ruby/devise-secure_password`
+- `devise-secure-password` (hyphen) → `dev-ruby/devise-secure-password`
+
+These are different gems on RubyGems and remain distinguishable in Gentoo.
 
 ```python
 from portage_pip_fuse.ecosystems.rubygems.name_translator import (
@@ -681,9 +685,10 @@ from portage_pip_fuse.ecosystems.rubygems.name_translator import (
 )
 
 translator = create_rubygems_translator()
-translator.rubygems_to_gentoo('activerecord')  # 'activerecord'
-translator.rubygems_to_gentoo('aws-sdk-s3')    # 'aws-sdk-s3'
-translator.gentoo_to_rubygems('rails')         # 'rails'
+translator.rubygems_to_gentoo('activerecord')          # 'activerecord'
+translator.rubygems_to_gentoo('devise-secure_password') # 'devise-secure_password'
+translator.rubygems_to_gentoo('iso-639')               # 'iso639' (trailing digits)
+translator.gentoo_to_rubygems('rails')                 # 'rails'
 ```
 
 Known mappings for common gems are built-in, and the translator can preload existing `dev-ruby/*` packages from Gentoo repositories.

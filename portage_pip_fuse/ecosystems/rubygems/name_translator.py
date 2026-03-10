@@ -223,29 +223,32 @@ class RubyGemsNameTranslator:
 
         Rules:
         1. Lowercase
-        2. Replace underscores with hyphens (for most gems)
-        3. Remove redundant hyphens
+        2. Preserve underscores (they're valid in Gentoo names per PMS 3.1.2)
+        3. Remove leading/trailing hyphens
         4. Fix names ending with -NUMBER (would conflict with version parsing)
+
+        Note: Underscores are preserved to distinguish gems like:
+        - devise-secure_password (underscore)
+        - devise-secure-password (hyphen)
+        These are different gems and should remain distinguishable.
         """
+        import re
+
         name = gem_name.lower()
 
-        # Replace underscores with hyphens (standard Gentoo convention)
-        name = name.replace('_', '-')
+        # Remove any leading/trailing hyphens or underscores
+        name = name.strip('-_')
 
-        # Remove any leading/trailing hyphens
-        name = name.strip('-')
-
-        # Remove duplicate hyphens
+        # Remove duplicate hyphens (but preserve single underscores)
         while '--' in name:
             name = name.replace('--', '-')
 
         # Fix names that end with hyphen-digits (e.g., iso-639 -> iso639)
         # These conflict with Gentoo's version parsing
-        # Pattern: name ends with -NNN where NNN is all digits
-        import re
-        match = re.search(r'-(\d+)$', name)
+        # Pattern: name ends with -NNN or _NNN where NNN is all digits
+        match = re.search(r'[-_](\d+)$', name)
         if match:
-            # Remove the hyphen before the trailing digits
+            # Remove the separator before the trailing digits
             name = name[:match.start()] + match.group(1)
 
         return name

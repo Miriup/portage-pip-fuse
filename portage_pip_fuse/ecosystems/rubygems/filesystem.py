@@ -235,7 +235,12 @@ cache-formats = md5-dict
         return {'type': 'unknown'}
 
     def _gentoo_to_gem(self, gentoo_name: str) -> Optional[str]:
-        """Convert Gentoo package name to gem name."""
+        """
+        Convert Gentoo package name to gem name.
+
+        Since underscores are now preserved in Gentoo names, the translation
+        is straightforward - the Gentoo name matches the gem name.
+        """
         return self.name_translator.gentoo_to_rubygems(gentoo_name)
 
     def _get_package_versions(self, gem_name: str) -> List[str]:
