@@ -243,6 +243,80 @@ class RubyGemsMetadataProvider(MetadataProviderBase):
                         packages.add(name)
         return packages
 
+    def list_all_packages(self) -> Set[str]:
+        """
+        List all available gem names from RubyGems.org.
+
+        Fetches the full gem names list from https://index.rubygems.org/names
+        which is a plain text file with one gem name per line.
+
+        The result is cached to disk with a 24-hour TTL to avoid
+        repeatedly downloading the ~3MB names file.
+
+        Returns:
+            Set of all gem names available on RubyGems.org (~190k gems)
+        """
+        import time
+
+        # Cache file path for the names list
+        names_cache_path = self.cache_dir / '_all_names.txt'
+        names_cache_ttl = 86400  # 24 hours
+
+        # Check disk cache first
+        if names_cache_path.exists():
+            try:
+                cache_age = time.time() - names_cache_path.stat().st_mtime
+                if cache_age < names_cache_ttl:
+                    logger.debug(f"Using cached gem names list (age: {cache_age:.0f}s)")
+                    with names_cache_path.open('r') as f:
+                        return set(line.strip() for line in f if line.strip() and line.strip() != '---')
+            except OSError as e:
+                logger.warning(f"Failed to read gem names cache: {e}")
+
+        # Fetch from RubyGems index
+        logger.info("Fetching all gem names from RubyGems.org...")
+        names_url = "https://index.rubygems.org/names"
+
+        try:
+            from portage_pip_fuse.constants import HTTP_TIMEOUT
+            import urllib.request
+
+            req = urllib.request.Request(names_url)
+            req.add_header('User-Agent', 'portage-gem-fuse/0.1.0')
+
+            # HTTP_TIMEOUT is a tuple (connect, read) for requests library
+            # urllib uses a single timeout value, so use the read timeout
+            timeout = HTTP_TIMEOUT[1] if isinstance(HTTP_TIMEOUT, tuple) else HTTP_TIMEOUT
+
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                content = response.read().decode('utf-8')
+
+            # Parse the names list (skip the '---' header line)
+            names = set()
+            for line in content.splitlines():
+                line = line.strip()
+                if line and line != '---':
+                    names.add(line)
+
+            logger.info(f"Fetched {len(names)} gem names from RubyGems.org")
+
+            # Cache to disk
+            try:
+                temp_path = names_cache_path.with_suffix('.tmp')
+                with temp_path.open('w') as f:
+                    f.write('\n'.join(sorted(names)))
+                temp_path.rename(names_cache_path)
+                logger.debug(f"Cached gem names list to {names_cache_path}")
+            except OSError as e:
+                logger.warning(f"Failed to cache gem names list: {e}")
+
+            return names
+
+        except Exception as e:
+            logger.error(f"Failed to fetch gem names list: {e}")
+            # Fall back to cached packages if available
+            return self.list_packages()
+
 
 class RubyGemsEbuildGenerator(EbuildGeneratorBase):
     """

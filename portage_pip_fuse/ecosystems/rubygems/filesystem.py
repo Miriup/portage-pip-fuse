@@ -269,8 +269,19 @@ cache-formats = md5-dict
                     gem_name, versions_metadata
                 )
 
-            # Sort versions (newest first)
-            versions = sorted(versions_metadata.keys(), reverse=True)
+            # Sort versions semantically (newest first)
+            # Handle non-PEP440 Ruby versions gracefully
+            from packaging.version import Version
+
+            def version_key(v):
+                try:
+                    # Valid versions get (1, Version) - higher priority
+                    return (1, Version(v))
+                except Exception:
+                    # Invalid/Ruby-style versions get (0, string) - appear at end
+                    return (0, v)
+
+            versions = sorted(versions_metadata.keys(), key=version_key, reverse=True)
 
             # Apply max_versions limit
             if self.max_versions > 0:
@@ -387,9 +398,9 @@ cache-formats = md5-dict
 
         # Use the ebuild generator
         return self.ebuild_generator.generate_ebuild(
-            name=gem_name,
+            package_info=info,
             version=gem_version,
-            metadata=info
+            gentoo_name=gentoo_name
         )
 
     def _generate_minimal_ebuild(self, gentoo_name: str, gem_name: str, version: str) -> str:
@@ -633,20 +644,48 @@ KEYWORDS="~amd64 ~arm64"
         elif parsed['type'] == 'category' and parsed['category'] == 'dev-ruby':
             # Check cache first
             cache_key = 'dev-ruby'
+            use_cache = False
             if cache_key in self._category_cache:
                 cached_packages, timestamp = self._category_cache[cache_key]
                 if time.time() - timestamp < self.cache_ttl:
+                    logger.debug(f"Using cached package list ({len(cached_packages)} packages)")
                     entries.extend(cached_packages)
-                    return entries
-                del self._category_cache[cache_key]
+                    use_cache = True
+                else:
+                    del self._category_cache[cache_key]
 
-            # For now, return empty - packages will be looked up on demand
-            # A full implementation would list all gems from RubyGems
-            # which is impractical (700k+ gems)
-            logger.info("dev-ruby category listing requested - returning empty (use direct package access)")
+            if not use_cache:
+                # Fetch all gem names from RubyGems.org
+                try:
+                    start_time = time.time()
+                    logger.info("Listing all gems from RubyGems.org...")
 
-            # Cache empty result
-            self._category_cache[cache_key] = ([], time.time())
+                    # Get all gem names from the metadata provider
+                    gem_names = self.metadata_provider.list_all_packages()
+
+                    # Convert gem names to Gentoo names
+                    gentoo_packages = []
+                    for gem_name in gem_names:
+                        gentoo_name = self.name_translator.rubygems_to_gentoo(gem_name)
+                        if gentoo_name:
+                            gentoo_packages.append(gentoo_name)
+                        else:
+                            # Use gem name directly (normalized)
+                            gentoo_packages.append(gem_name.lower().replace('_', '-'))
+
+                    sorted_packages = sorted(gentoo_packages)
+
+                    # Cache the result
+                    self._category_cache[cache_key] = (sorted_packages, time.time())
+
+                    entries.extend(sorted_packages)
+
+                    elapsed = time.time() - start_time
+                    logger.info(f"Listed {len(gentoo_packages)} packages in {elapsed:.2f} seconds")
+
+                except Exception as e:
+                    logger.error(f"Error listing packages: {e}")
+                    logger.warning("Package listing failed, returning empty directory")
 
         elif parsed['type'] == 'package':
             # List versions and files for a package

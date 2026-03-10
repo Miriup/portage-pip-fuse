@@ -81,6 +81,11 @@ class RubyGemsNameTranslator:
         'nio4r': 'nio4r',
         'websocket-driver': 'websocket-driver',
         'websocket-extensions': 'websocket-extensions',
+
+        # Gems with trailing numbers (conflict with Gentoo version parsing)
+        'iso-639': 'iso639',
+        'oauth2': 'oauth2',
+        'net-http2': 'net-http2',
     }
 
     # Reverse mappings (gentoo -> gem)
@@ -207,9 +212,10 @@ class RubyGemsNameTranslator:
         if gentoo_name in self._gentoo_to_gem:
             return self._gentoo_to_gem[gentoo_name]
 
-        # For most gems, the name is the same or with hyphens replaced
-        # by underscores (more common in gem land)
-        return gentoo_name.replace('-', '_')
+        # Most gems use the same name as Gentoo (with hyphens)
+        # Only a few legacy gems use underscores instead of hyphens
+        # Return the name as-is - it's more likely to be correct
+        return gentoo_name
 
     def _apply_translation_rules(self, gem_name: str) -> str:
         """
@@ -219,6 +225,7 @@ class RubyGemsNameTranslator:
         1. Lowercase
         2. Replace underscores with hyphens (for most gems)
         3. Remove redundant hyphens
+        4. Fix names ending with -NUMBER (would conflict with version parsing)
         """
         name = gem_name.lower()
 
@@ -231,6 +238,15 @@ class RubyGemsNameTranslator:
         # Remove duplicate hyphens
         while '--' in name:
             name = name.replace('--', '-')
+
+        # Fix names that end with hyphen-digits (e.g., iso-639 -> iso639)
+        # These conflict with Gentoo's version parsing
+        # Pattern: name ends with -NNN where NNN is all digits
+        import re
+        match = re.search(r'-(\d+)$', name)
+        if match:
+            # Remove the hyphen before the trailing digits
+            name = name[:match.start()] + match.group(1)
 
         return name
 

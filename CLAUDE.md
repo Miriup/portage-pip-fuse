@@ -332,6 +332,37 @@ portage-gem-fuse unmount     # Unmount filesystem
 portage-gem-fuse install     # Create repos.conf
 portage-gem-fuse gem         # gem install translation
 portage-gem-fuse bundle      # bundle install translation (from Gemfile.lock)
+portage-gem-fuse debug       # Debug commands for inspecting gem metadata
+```
+
+### debug Subcommand
+
+The `debug` subcommand provides tools for inspecting RubyGems metadata and troubleshooting:
+
+```bash
+# Show available versions for a gem (semantically sorted)
+portage-gem-fuse debug versions <gem>
+portage-gem-fuse debug versions faraday
+
+# Show gem metadata (latest or specific version)
+portage-gem-fuse debug info <gem>
+portage-gem-fuse debug info rails --version 7.0.0
+
+# Show name translation (gem <-> Gentoo)
+portage-gem-fuse debug translate <name>
+portage-gem-fuse debug translate iso-639
+
+# Show which versions pass the filters (ruby-compat, platform, pre-release, source)
+portage-gem-fuse debug filter <gem>
+portage-gem-fuse debug filter nokogiri --use-ruby "ruby32 ruby33"
+
+# Show dependencies with Gentoo name translation
+portage-gem-fuse debug deps <gem>
+portage-gem-fuse debug deps rails
+
+# JSON output for scripting
+portage-gem-fuse debug info rails --json
+portage-gem-fuse debug versions faraday --json
 ```
 
 ### pip Subcommand Implementation

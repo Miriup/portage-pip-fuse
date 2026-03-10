@@ -1907,6 +1907,7 @@ Subcommands:
   install   Create /etc/portage/repos.conf entry for the overlay
   gem       Translate gem install commands to emerge
   bundle    Install from Gemfile.lock via emerge
+  debug     Debug commands for inspecting gem metadata
 
 Examples:
   %(prog)s mount                               # Mount at /var/db/repos/rubygems
@@ -1914,6 +1915,8 @@ Examples:
   %(prog)s unmount                             # Unmount
   %(prog)s gem install rails                   # emerge dev-ruby/rails
   %(prog)s bundle install                      # Install from Gemfile.lock
+  %(prog)s debug versions faraday              # Show available versions
+  %(prog)s debug info rails                    # Show gem metadata
 
 For subcommand help:
   %(prog)s <subcommand> --help
@@ -1924,7 +1927,7 @@ For subcommand help:
     parser.add_argument(
         'subcommand',
         nargs='?',
-        choices=['mount', 'unmount', 'install', 'gem', 'bundle'],
+        choices=['mount', 'unmount', 'install', 'gem', 'bundle', 'debug'],
         help='Subcommand to run'
     )
 
@@ -1954,6 +1957,8 @@ For subcommand help:
         return gem_command()
     elif subcommand == 'bundle':
         return bundle_command()
+    elif subcommand == 'debug':
+        return rubygems_debug_command()
     else:
         print(f"Unknown subcommand: {subcommand}")
         parser.print_help()
@@ -2302,6 +2307,355 @@ priority = {args.priority}
         print(f"Error: Permission denied writing to {conf_file}")
         print("Try running with sudo")
         return 1
+
+
+def rubygems_debug_command():
+    """Handle debug subcommand for RubyGems - inspect gem metadata."""
+    import json
+
+    parser = argparse.ArgumentParser(
+        prog='portage-gem-fuse debug',
+        description='Debug commands for inspecting RubyGems metadata',
+        epilog='''
+Debug subcommands:
+  versions <gem>    Show available versions for a gem
+  info <gem>        Show gem metadata (latest version)
+  translate <name>  Show name translation (gem <-> gentoo)
+  filter <gem>      Show which versions pass the filters
+  deps <gem>        Show dependencies for a gem
+
+Examples:
+  %(prog)s versions faraday          # List all versions
+  %(prog)s info rails                # Show rails metadata
+  %(prog)s translate iso-639         # Show name translation
+  %(prog)s filter nokogiri           # Show filtered versions
+  %(prog)s deps rails                # Show dependencies
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument(
+        'debug_command',
+        choices=['versions', 'info', 'translate', 'filter', 'deps'],
+        help='Debug command to run'
+    )
+
+    parser.add_argument(
+        'name',
+        help='Gem name or package name to inspect'
+    )
+
+    parser.add_argument(
+        '--version', '-v',
+        type=str,
+        help='Specific version (for info/deps commands)'
+    )
+
+    parser.add_argument(
+        '--json',
+        action='store_true',
+        help='Output as JSON'
+    )
+
+    parser.add_argument(
+        '--use-ruby',
+        type=str,
+        default='ruby32 ruby33',
+        help='USE_RUBY targets for filter command (default: ruby32 ruby33)'
+    )
+
+    # Parse args (skip 'debug' from argv)
+    debug_argv = [arg for arg in sys.argv[1:] if arg != 'debug']
+
+    if not debug_argv:
+        parser.print_help()
+        return 0
+
+    args = parser.parse_args(debug_argv)
+
+    # Import required modules
+    from portage_pip_fuse.ecosystems.rubygems.plugin import RubyGemsMetadataProvider
+    from portage_pip_fuse.ecosystems.rubygems.name_translator import create_rubygems_translator
+    from portage_pip_fuse.ecosystems.rubygems.filters import (
+        RubyCompatFilter,
+        PlatformFilter,
+        PreReleaseFilter,
+        GemSourceFilter,
+        VersionFilterChain,
+    )
+
+    provider = RubyGemsMetadataProvider()
+    translator = create_rubygems_translator()
+
+    if args.debug_command == 'versions':
+        return _debug_versions(provider, args.name, args.json)
+    elif args.debug_command == 'info':
+        return _debug_info(provider, args.name, args.version, args.json)
+    elif args.debug_command == 'translate':
+        return _debug_translate(translator, args.name, args.json)
+    elif args.debug_command == 'filter':
+        use_ruby = args.use_ruby.split()
+        return _debug_filter(provider, args.name, use_ruby, args.json)
+    elif args.debug_command == 'deps':
+        return _debug_deps(provider, translator, args.name, args.version, args.json)
+
+    return 0
+
+
+def _debug_versions(provider, gem_name, as_json):
+    """Show available versions for a gem."""
+    import json
+    from packaging.version import Version
+
+    versions = provider.get_package_versions(gem_name)
+
+    if not versions:
+        print(f"No versions found for '{gem_name}'")
+        return 1
+
+    # Sort semantically, handling invalid versions gracefully
+    def version_key(v):
+        try:
+            # Valid versions get (1, Version) - higher priority in descending sort
+            return (1, Version(v))
+        except Exception:
+            # Invalid versions get (0, string) - appear at end in descending sort
+            return (0, v)
+
+    versions = sorted(versions, key=version_key, reverse=True)
+
+    if as_json:
+        print(json.dumps({'gem': gem_name, 'versions': versions}, indent=2))
+    else:
+        print(f"Versions for {gem_name} ({len(versions)} total):")
+        print()
+        # Show in columns
+        cols = 5
+        for i in range(0, len(versions), cols):
+            row = versions[i:i+cols]
+            print("  " + "  ".join(f"{v:15}" for v in row))
+
+    return 0
+
+
+def _debug_info(provider, gem_name, version, as_json):
+    """Show gem metadata."""
+    import json
+
+    if version:
+        info = provider.get_version_info(gem_name, version)
+    else:
+        info = provider.get_package_info(gem_name)
+
+    if not info:
+        print(f"No info found for '{gem_name}'")
+        return 1
+
+    if as_json:
+        print(json.dumps(info, indent=2, default=str))
+    else:
+        print(f"Gem: {info.get('name', gem_name)}")
+        print(f"Version: {info.get('version', info.get('number', 'latest'))}")
+        print(f"Platform: {info.get('platform', 'ruby')}")
+        print(f"Authors: {info.get('authors', 'N/A')}")
+        print(f"License: {info.get('licenses', 'N/A')}")
+        print(f"Homepage: {info.get('homepage_uri', info.get('project_uri', 'N/A'))}")
+        print(f"Ruby Version: {info.get('required_ruby_version', info.get('ruby_version', 'any'))}")
+        print()
+        print(f"Summary: {info.get('summary', info.get('info', 'N/A')[:200])}")
+        print()
+
+        # Show dependencies if available
+        deps = info.get('dependencies', {})
+        if deps:
+            runtime_deps = deps.get('runtime', [])
+            dev_deps = deps.get('development', [])
+
+            if runtime_deps:
+                print(f"Runtime dependencies ({len(runtime_deps)}):")
+                for dep in runtime_deps[:10]:
+                    print(f"  {dep.get('name')}: {dep.get('requirements', '>= 0')}")
+                if len(runtime_deps) > 10:
+                    print(f"  ... and {len(runtime_deps) - 10} more")
+
+            if dev_deps:
+                print(f"\nDevelopment dependencies ({len(dev_deps)}):")
+                for dep in dev_deps[:5]:
+                    print(f"  {dep.get('name')}: {dep.get('requirements', '>= 0')}")
+                if len(dev_deps) > 5:
+                    print(f"  ... and {len(dev_deps) - 5} more")
+
+    return 0
+
+
+def _debug_translate(translator, name, as_json):
+    """Show name translation both directions."""
+    import json
+
+    gentoo_name = translator.rubygems_to_gentoo(name)
+    gem_name = translator.gentoo_to_rubygems(name)
+
+    if as_json:
+        print(json.dumps({
+            'input': name,
+            'as_gem_to_gentoo': gentoo_name,
+            'as_gentoo_to_gem': gem_name,
+        }, indent=2))
+    else:
+        print(f"Input: {name}")
+        print()
+        print(f"As gem name -> Gentoo:  {name} -> {gentoo_name}")
+        print(f"As Gentoo -> gem name:  {name} -> {gem_name}")
+        print()
+        print(f"Gentoo atom: dev-ruby/{gentoo_name}")
+        print(f"RubyGems URL: https://rubygems.org/gems/{gem_name}")
+
+    return 0
+
+
+def _debug_filter(provider, gem_name, use_ruby, as_json):
+    """Show which versions pass the filters."""
+    import json
+    from packaging.version import Version
+    from portage_pip_fuse.ecosystems.rubygems.filters import (
+        RubyCompatFilter,
+        PlatformFilter,
+        PreReleaseFilter,
+        GemSourceFilter,
+        VersionFilterChain,
+    )
+
+    # Get all versions metadata
+    versions_data = provider.get_versions_metadata(gem_name)
+
+    if not versions_data:
+        print(f"No versions found for '{gem_name}'")
+        return 1
+
+    # Build versions dict
+    all_versions = {}
+    for v in versions_data:
+        if isinstance(v, dict):
+            ver = v.get('number', '')
+            if ver:
+                all_versions[ver] = v
+
+    # Create filter chain
+    filters = [
+        RubyCompatFilter(use_ruby=use_ruby),
+        PlatformFilter(),
+        PreReleaseFilter(include_pre=False),
+        GemSourceFilter(include_git=True),
+    ]
+    filter_chain = VersionFilterChain(filters)
+
+    # Apply filters
+    filtered = filter_chain.filter_versions(gem_name, all_versions)
+
+    # Sort versions (handle invalid versions gracefully)
+    def version_key(v):
+        try:
+            return (1, Version(v))
+        except Exception:
+            return (0, v)
+
+    all_sorted = sorted(all_versions.keys(), key=version_key, reverse=True)
+    filtered_sorted = sorted(filtered.keys(), key=version_key, reverse=True)
+
+    if as_json:
+        print(json.dumps({
+            'gem': gem_name,
+            'total_versions': len(all_versions),
+            'filtered_versions': len(filtered),
+            'use_ruby': use_ruby,
+            'filters': filter_chain.get_description(),
+            'passed': filtered_sorted,
+            'rejected': [v for v in all_sorted if v not in filtered],
+        }, indent=2))
+    else:
+        print(f"Filter results for {gem_name}")
+        print(f"USE_RUBY: {', '.join(use_ruby)}")
+        print(f"Filters: {filter_chain.get_description()}")
+        print()
+        print(f"Total versions: {len(all_versions)}")
+        print(f"Passed filter: {len(filtered)}")
+        print()
+
+        if filtered_sorted:
+            print("Versions that pass (newest first):")
+            cols = 5
+            for i in range(0, min(len(filtered_sorted), 20), cols):
+                row = filtered_sorted[i:i+cols]
+                print("  " + "  ".join(f"{v:15}" for v in row))
+            if len(filtered_sorted) > 20:
+                print(f"  ... and {len(filtered_sorted) - 20} more")
+        else:
+            print("No versions pass the filters!")
+            print()
+            # Show why some versions were rejected
+            print("Sample rejected versions:")
+            for v in all_sorted[:5]:
+                meta = all_versions[v]
+                reasons = []
+                if meta.get('prerelease'):
+                    reasons.append('pre-release')
+                platform = meta.get('platform', 'ruby')
+                if platform not in ('ruby', None, ''):
+                    reasons.append(f'platform={platform}')
+                ruby_req = meta.get('required_ruby_version') or meta.get('ruby_version')
+                if ruby_req:
+                    reasons.append(f'ruby={ruby_req}')
+                print(f"  {v}: {', '.join(reasons) if reasons else 'unknown reason'}")
+
+    return 0
+
+
+def _debug_deps(provider, translator, gem_name, version, as_json):
+    """Show dependencies for a gem."""
+    import json
+
+    if version:
+        info = provider.get_version_info(gem_name, version)
+    else:
+        info = provider.get_package_info(gem_name)
+
+    if not info:
+        print(f"No info found for '{gem_name}'")
+        return 1
+
+    deps = info.get('dependencies', {})
+    runtime_deps = deps.get('runtime', [])
+
+    if as_json:
+        # Add Gentoo translations
+        for dep in runtime_deps:
+            dep['gentoo_name'] = translator.rubygems_to_gentoo(dep.get('name', ''))
+        print(json.dumps({
+            'gem': gem_name,
+            'version': version or info.get('version', 'latest'),
+            'runtime_dependencies': runtime_deps,
+        }, indent=2))
+    else:
+        ver = version or info.get('version', 'latest')
+        print(f"Dependencies for {gem_name}-{ver}")
+        print()
+
+        if not runtime_deps:
+            print("No runtime dependencies")
+            return 0
+
+        print(f"Runtime dependencies ({len(runtime_deps)}):")
+        print()
+        print(f"  {'Gem Name':<25} {'Constraint':<20} {'Gentoo Name':<25}")
+        print(f"  {'-'*25} {'-'*20} {'-'*25}")
+
+        for dep in runtime_deps:
+            dep_name = dep.get('name', '')
+            constraint = dep.get('requirements', '>= 0')
+            gentoo_name = translator.rubygems_to_gentoo(dep_name)
+            print(f"  {dep_name:<25} {constraint:<20} {gentoo_name:<25}")
+
+    return 0
 
 
 if __name__ == "__main__":

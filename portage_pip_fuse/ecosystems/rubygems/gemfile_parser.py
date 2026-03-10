@@ -212,15 +212,30 @@ def _parse_gem_entry(lines: List[str], index: int, source_uri: str) -> Optional[
     name = match.group(1)
     version_str = match.group(2)
 
-    # Handle platform suffix (e.g., "1.0.0-java")
+    # Handle platform suffix (e.g., "1.0.0-java", "1.18.9-x86_64-linux-gnu")
     platform = None
     version = version_str
-    if '-' in version_str:
-        parts = version_str.rsplit('-', 1)
-        # Check if last part is a platform
-        if parts[1] in {'ruby', 'java', 'jruby', 'mswin', 'mingw', 'x64-mingw', 'darwin'}:
-            version = parts[0]
-            platform = parts[1]
+
+    # Platform suffixes can be complex like x86_64-linux-gnu, arm64-darwin, etc.
+    # They typically start with an architecture or simple platform name
+    platform_patterns = [
+        # Architecture-based platforms
+        r'-x86_64-.*$',
+        r'-x86-.*$',
+        r'-arm64-.*$',
+        r'-aarch64-.*$',
+        r'-i686-.*$',
+        r'-universal-.*$',
+        # Simple platforms
+        r'-(ruby|java|jruby|mswin|mswin32|mswin64|mingw|mingw32|x64-mingw32|x64-mingw-ucrt|darwin)$',
+    ]
+
+    for pattern in platform_patterns:
+        match = re.search(pattern, version_str)
+        if match:
+            platform = match.group(0)[1:]  # Remove leading hyphen
+            version = version_str[:match.start()]
+            break
 
     # Parse dependencies (indented lines after this)
     dependencies = []
