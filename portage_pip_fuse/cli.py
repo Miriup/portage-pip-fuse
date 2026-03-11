@@ -2061,10 +2061,27 @@ To unmount:
         help='Limit versions shown per package (default: 0=unlimited)'
     )
 
+    # Available version filters for RubyGems
+    # Default filters: gentoo-version, ruby-compat, platform, gem-source
+    # Optional filters: pre-release (filters out alpha/beta/rc versions)
+    available_filters = ['gentoo-version', 'ruby-compat', 'platform', 'gem-source', 'pre-release']
+
     mount_parser.add_argument(
-        '--include-pre',
-        action='store_true',
-        help='Include pre-release versions (alpha, beta, rc)'
+        '--filter',
+        type=str,
+        action='append',
+        choices=available_filters,
+        metavar='FILTER',
+        help=f'Enable optional filter (available: {", ".join(available_filters)}). Can be used multiple times.'
+    )
+
+    mount_parser.add_argument(
+        '--no-filter',
+        type=str,
+        action='append',
+        choices=available_filters,
+        metavar='FILTER',
+        help=f'Disable default filter (available: {", ".join(available_filters)}). Can be used multiple times.'
     )
 
     # Remove 'mount' from argv
@@ -2104,9 +2121,14 @@ To unmount:
     logger = logging.getLogger(__name__)
 
     # Build filter configuration
+    # Default filters run unless disabled with --no-filter
+    # Optional filters (like pre-release) only run if enabled with --filter
+    enabled_filters = set(args.filter) if args.filter else set()
+    disabled_filters = set(args.no_filter) if args.no_filter else set()
+
     filter_config = {
-        'disabled_filters': [],
-        'include_pre': args.include_pre,
+        'enabled_filters': list(enabled_filters),
+        'disabled_filters': list(disabled_filters),
         'include_git': not args.no_git_source,
         'max_versions': args.max_versions,
     }
@@ -2147,8 +2169,10 @@ To unmount:
     print(f"USE_RUBY: {', '.join(use_ruby)}")
     print(f"Max versions per package: {args.max_versions if args.max_versions > 0 else 'unlimited'}")
 
-    if args.include_pre:
-        print("Including pre-release versions")
+    if enabled_filters:
+        print(f"Enabled filters: {', '.join(sorted(enabled_filters))}")
+    if disabled_filters:
+        print(f"Disabled filters: {', '.join(sorted(disabled_filters))}")
 
     if pid_file_path:
         print(f"PID file: {pid_file_path}")
@@ -2379,7 +2403,6 @@ Examples:
     from portage_pip_fuse.ecosystems.rubygems.filters import (
         RubyCompatFilter,
         PlatformFilter,
-        PreReleaseFilter,
         GemSourceFilter,
         VersionFilterChain,
     )
@@ -2520,7 +2543,6 @@ def _debug_filter(provider, gem_name, use_ruby, as_json):
     from portage_pip_fuse.ecosystems.rubygems.filters import (
         RubyCompatFilter,
         PlatformFilter,
-        PreReleaseFilter,
         GemSourceFilter,
         VersionFilterChain,
     )
@@ -2540,11 +2562,10 @@ def _debug_filter(provider, gem_name, use_ruby, as_json):
             if ver:
                 all_versions[ver] = v
 
-    # Create filter chain
+    # Create filter chain (default filters, pre-release is opt-in)
     filters = [
         RubyCompatFilter(use_ruby=use_ruby),
         PlatformFilter(),
-        PreReleaseFilter(include_pre=False),
         GemSourceFilter(include_git=True),
     ]
     filter_chain = VersionFilterChain(filters)

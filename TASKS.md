@@ -25,10 +25,39 @@ spec.licenses = ["MIT"]
 
 **Status:** Not yet reported
 
-**Gem:**: `gmail_xoauth`
+### gmail_xoauth gem missing license in gemspec
+
+**Gem:** gmail_xoauth
 **Version:** 0.4.3
 
-**Issue:** Same as ai-agents
+**Issue:** Same as ai-agents - missing license declaration in gemspec.
+
+**Status:** Not yet reported
+
+### selectize-rails gem malformed license in gemspec
+
+**Gem:** selectize-rails
+**Version:** 0.12.6
+**Repository:** https://github.com/manuelvanrijn/selectize-rails
+
+**Issue:** The gemspec declares license as a single string containing multiple licenses: `"MIT, Apache License v2.0"` instead of using the proper array format.
+
+**Current (incorrect):**
+```ruby
+spec.license = "MIT, Apache License v2.0"
+```
+
+**Fix needed in upstream:**
+```ruby
+spec.licenses = ["MIT", "Apache-2.0"]
+```
+
+**Workaround applied:** Added `"MIT, Apache License v2.0"` license to `/etc/portage/package.license`:
+```
+dev-ruby/selectize-rails MIT,\ Apache\ License\ v2.0
+```
+
+**Status:** Not yet reported
 
 ## Documentation Tasks
 

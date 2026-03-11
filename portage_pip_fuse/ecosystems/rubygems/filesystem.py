@@ -135,30 +135,42 @@ class PortageGemFS(Operations):
             logger.info(f"Version filters: {self.version_filter_chain.get_description()}")
 
     def _create_version_filter(self, filter_config: Dict) -> Optional[VersionFilterChain]:
-        """Create version filter chain based on configuration."""
+        """Create version filter chain based on configuration.
+
+        Default filters (run unless --no-filter disables them):
+        - gentoo-version: Filter out versions that can't be translated to PMS format
+        - ruby-compat: Filter by USE_RUBY compatibility
+        - platform: Filter out java, mswin, etc.
+        - gem-source: Filter to gems with .gem files or git sources
+
+        Optional filters (only run if --filter enables them):
+        - pre-release: Filter out alpha/beta/rc versions (prefer portage masking)
+        """
+        enabled_filters = set(filter_config.get('enabled_filters', []))
         disabled_filters = set(filter_config.get('disabled_filters', []))
 
         filters = []
 
-        # Gentoo version format filter (always enabled - non-translatable versions
-        # would produce invalid ebuild names)
+        # Gentoo version format filter (default: enabled)
+        # Non-translatable versions would produce invalid ebuild names
         if 'gentoo-version' not in disabled_filters:
             filters.append(GentooVersionFilter())
 
-        # Ruby compatibility filter
+        # Ruby compatibility filter (default: enabled)
         if 'ruby-compat' not in disabled_filters:
             filters.append(RubyCompatFilter(use_ruby=self.use_ruby))
 
-        # Platform filter (exclude java, mswin, etc.)
+        # Platform filter (default: enabled)
+        # Exclude java, mswin, etc.
         if 'platform' not in disabled_filters:
             filters.append(PlatformFilter())
 
-        # Pre-release filter
-        if 'pre-release' not in disabled_filters:
-            include_pre = filter_config.get('include_pre', False)
-            filters.append(PreReleaseFilter(include_pre=include_pre))
+        # Pre-release filter (default: disabled, opt-in with --filter pre-release)
+        # Prefer handling pre-releases at portage level via package.mask
+        if 'pre-release' in enabled_filters and 'pre-release' not in disabled_filters:
+            filters.append(PreReleaseFilter(include_pre=False))
 
-        # Source filter
+        # Source filter (default: enabled)
         if 'gem-source' not in disabled_filters:
             include_git = filter_config.get('include_git', True)
             filters.append(GemSourceFilter(include_git=include_git))
