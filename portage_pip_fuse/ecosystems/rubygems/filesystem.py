@@ -256,8 +256,7 @@ cache-formats = md5-dict
         """
         Convert Gentoo package name to gem name.
 
-        Since underscores are now preserved in Gentoo names, the translation
-        is straightforward - the Gentoo name matches the gem name.
+        Since we preserve original case, this is typically identity.
         """
         return self.name_translator.gentoo_to_rubygems(gentoo_name)
 
@@ -763,15 +762,15 @@ KEYWORDS="~amd64 ~arm64"
                     # Get all gem names from the metadata provider
                     gem_names = self.metadata_provider.list_all_packages()
 
-                    # Convert gem names to Gentoo names
+                    # Convert gem names to Gentoo names (preserves original case)
                     gentoo_packages = []
                     for gem_name in gem_names:
                         gentoo_name = self.name_translator.rubygems_to_gentoo(gem_name)
                         if gentoo_name:
                             gentoo_packages.append(gentoo_name)
                         else:
-                            # Use gem name directly (normalized)
-                            gentoo_packages.append(gem_name.lower().replace('_', '-'))
+                            # Use gem name directly
+                            gentoo_packages.append(gem_name)
 
                     sorted_packages = sorted(gentoo_packages)
 

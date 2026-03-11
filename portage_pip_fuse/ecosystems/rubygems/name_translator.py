@@ -166,9 +166,8 @@ class RubyGemsNameTranslator:
         """
         Translate RubyGems package name to Gentoo package name.
 
-        Uses exact gem names by default. Explicit mappings from KNOWN_MAPPINGS
-        or extracted from Gentoo metadata.xml are used when available.
-        For mismatches, use the .sys patching mechanism to configure mappings.
+        Preserves original case since PMS 3.1.2 allows [A-Za-z0-9+_-].
+        Only applies minimal fixes for PMS compatibility (trailing digits).
 
         Args:
             gem_name: RubyGems gem name
@@ -178,23 +177,21 @@ class RubyGemsNameTranslator:
 
         Examples:
             >>> translator = RubyGemsNameTranslator(preload_gentoo=False)
-            >>> translator.rubygems_to_gentoo('active_support')
-            'activesupport'
+            >>> translator.rubygems_to_gentoo('RedCloth')
+            'RedCloth'
             >>> translator.rubygems_to_gentoo('rspec-core')
             'rspec-core'
-            >>> translator.rubygems_to_gentoo('my_new_gem')
-            'my_new_gem'
-            >>> translator.rubygems_to_gentoo('ruby-debug')
-            'ruby-debug'
+            >>> translator.rubygems_to_gentoo('iso-639')
+            'iso639'
         """
-        # Normalize input
-        gem_name = gem_name.strip().lower()
+        gem_name = gem_name.strip()
 
         # Check known mappings first (from KNOWN_MAPPINGS or Gentoo metadata.xml)
-        if gem_name in self._gem_to_gentoo:
-            return self._gem_to_gentoo[gem_name]
+        gem_lower = gem_name.lower()
+        if gem_lower in self._gem_to_gentoo:
+            return self._gem_to_gentoo[gem_lower]
 
-        # Apply minimal translation rules (lowercase, fix PMS-incompatible names)
+        # Apply minimal translation rules (fix PMS-incompatible names only)
         gentoo_name = self._apply_translation_rules(gem_name)
 
         return gentoo_name
@@ -202,6 +199,8 @@ class RubyGemsNameTranslator:
     def gentoo_to_rubygems(self, gentoo_name: str, hint: Optional[str] = None) -> str:
         """
         Translate Gentoo package name to RubyGems name.
+
+        Since we now preserve original case, this is typically identity.
 
         Args:
             gentoo_name: Gentoo package name (without category)
@@ -212,54 +211,44 @@ class RubyGemsNameTranslator:
 
         Examples:
             >>> translator = RubyGemsNameTranslator(preload_gentoo=False)
-            >>> translator.gentoo_to_rubygems('activesupport')
-            'activesupport'
+            >>> translator.gentoo_to_rubygems('RedCloth')
+            'RedCloth'
             >>> translator.gentoo_to_rubygems('rspec-core')
             'rspec-core'
         """
-        gentoo_name = gentoo_name.strip().lower()
+        gentoo_name = gentoo_name.strip()
 
-        # Check known mappings first
-        if gentoo_name in self._gentoo_to_gem:
-            return self._gentoo_to_gem[gentoo_name]
+        # Check known mappings first (lowercase key lookup)
+        gentoo_lower = gentoo_name.lower()
+        if gentoo_lower in self._gentoo_to_gem:
+            return self._gentoo_to_gem[gentoo_lower]
 
-        # Most gems use the same name as Gentoo (with hyphens)
-        # Only a few legacy gems use underscores instead of hyphens
-        # Return the name as-is - it's more likely to be correct
+        # Return as-is since we preserve original case
         return gentoo_name
 
     def _apply_translation_rules(self, gem_name: str) -> str:
         """
-        Apply standard translation rules to convert gem name to Gentoo name.
+        Apply minimal translation rules for PMS compatibility.
 
         Rules:
-        1. Lowercase
-        2. Preserve underscores (valid in Gentoo names per PMS 3.1.2)
-        3. Remove leading/trailing hyphens or underscores
-        4. Fix names ending with hyphen-digits (e.g., iso-639 -> iso639)
-           Only hyphens are problematic as they look like version suffixes.
-           Underscores before digits are fine (e.g., rubocop-ruby3_2 stays as-is).
-
-        Note: Underscores are preserved to distinguish gems like:
-        - devise-secure_password (underscore)
-        - devise-secure-password (hyphen)
-        These are different gems and should remain distinguishable.
+        1. Preserve original case (PMS allows [A-Za-z0-9+_-])
+        2. Remove leading/trailing hyphens or underscores
+        3. Fix names ending with hyphen-digits (e.g., iso-639 -> iso639)
+           These conflict with Gentoo's version parsing.
         """
         import re
 
-        name = gem_name.lower()
+        name = gem_name
 
         # Remove any leading/trailing hyphens or underscores
         name = name.strip('-_')
 
-        # Remove duplicate hyphens (but preserve single underscores)
+        # Remove duplicate hyphens
         while '--' in name:
             name = name.replace('--', '-')
 
         # Fix names that end with hyphen-digits (e.g., iso-639 -> iso639)
         # These conflict with Gentoo's version parsing (looks like a version suffix)
-        # Only hyphens are problematic - underscores are valid per PMS 3.1.2
-        # and don't conflict with version parsing (e.g., rubocop-ruby3_2 is fine)
         match = re.search(r'-(\d+)$', name)
         if match:
             # Remove the hyphen before the trailing digits
@@ -314,7 +303,7 @@ class CachedRubyGemsTranslator(RubyGemsNameTranslator):
 
     def rubygems_to_gentoo(self, gem_name: str) -> str:
         """Translate with caching."""
-        gem_name = gem_name.strip().lower()
+        gem_name = gem_name.strip()
         if gem_name in self._forward_cache:
             return self._forward_cache[gem_name]
 
@@ -324,7 +313,7 @@ class CachedRubyGemsTranslator(RubyGemsNameTranslator):
 
     def gentoo_to_rubygems(self, gentoo_name: str, hint: Optional[str] = None) -> str:
         """Translate with caching."""
-        gentoo_name = gentoo_name.strip().lower()
+        gentoo_name = gentoo_name.strip()
         cache_key = f"{gentoo_name}:{hint}" if hint else gentoo_name
         if cache_key in self._reverse_cache:
             return self._reverse_cache[cache_key]
