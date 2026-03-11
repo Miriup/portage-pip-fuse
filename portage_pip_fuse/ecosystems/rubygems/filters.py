@@ -503,8 +503,161 @@ class RubyVersionFilterRegistry:
         return cls._filters.copy()
 
 
+class GentooVersionFilter:
+    """
+    Filter gem versions to only those that can be translated to valid Gentoo PMS format.
+
+    Gentoo PMS version format:
+        version ::= [0-9]+(\\.[0-9]+)*[a-z]?((_alpha|_beta|_pre|_rc|_p)[0-9]*)*(-r[0-9]+)?
+
+    This filter rejects versions with:
+    - Non-standard suffixes (e.g., .racecar1, .RELEASE)
+    - Invalid suffix combinations that can't be translated
+    """
+
+    # Standard Gentoo pre-release suffix names
+    STANDARD_SUFFIXES = {'alpha', 'beta', 'pre', 'rc', 'p'}
+
+    # Ruby shorthand -> Gentoo suffix (e.g., 5.a -> 5_alpha)
+    SHORTHAND_MAP = {'a': 'alpha', 'b': 'beta'}
+
+    @classmethod
+    def get_filter_name(cls) -> str:
+        """Get the filter name for registry."""
+        return "gentoo-version"
+
+    def get_description(self) -> str:
+        """Get human-readable description."""
+        return "Filters gems to those with Gentoo-compatible version strings"
+
+    def filter_versions(
+        self,
+        gem_name: str,
+        versions_metadata: Dict[str, Dict]
+    ) -> Dict[str, Dict]:
+        """
+        Filter versions to only Gentoo-compatible ones.
+
+        Args:
+            gem_name: Name of the gem
+            versions_metadata: Dict mapping version -> metadata
+
+        Returns:
+            Filtered dict of version -> metadata
+        """
+        filtered = {}
+
+        for version, metadata in versions_metadata.items():
+            if self.should_include_version(gem_name, version, metadata):
+                filtered[version] = metadata
+
+        return filtered
+
+    def should_include_version(
+        self,
+        gem_name: str,
+        version: str,
+        metadata: Dict[str, Any]
+    ) -> bool:
+        """
+        Check if a version can be translated to valid Gentoo format.
+
+        Args:
+            gem_name: Name of the gem
+            version: Version string
+            metadata: Version metadata dict
+
+        Returns:
+            True if version is Gentoo-compatible
+        """
+        return self._can_translate_version(version)
+
+    def _can_translate_version(self, gem_version: str) -> bool:
+        """
+        Check if a gem version can be translated to valid Gentoo PMS format.
+
+        Args:
+            gem_version: Ruby gem version string
+
+        Returns:
+            True if the version can be translated to valid Gentoo format
+
+        Examples:
+            >>> f = GentooVersionFilter()
+            >>> f._can_translate_version('1.0.0')
+            True
+            >>> f._can_translate_version('2.0.0.alpha1')
+            True
+            >>> f._can_translate_version('2.0.0.alpha.pre.4')
+            True
+            >>> f._can_translate_version('5.0.0.beta1.1')
+            True
+            >>> f._can_translate_version('5.a')
+            True
+            >>> f._can_translate_version('5.b')
+            True
+            >>> f._can_translate_version('5.a1')
+            True
+            >>> f._can_translate_version('5.0.0.racecar1')
+            False
+            >>> f._can_translate_version('1.0.0.RELEASE')
+            False
+        """
+        # Split into base version (numbers.numbers...) and suffix
+        match = re.match(r'^(\d+(?:\.\d+)*)(.*)$', gem_version)
+        if not match:
+            return False
+
+        base, suffix = match.groups()
+
+        if not suffix:
+            return True  # Pure numeric version is always valid
+
+        # Parse suffix components
+        suffix = suffix.lstrip('.')
+        if not suffix:
+            return True
+
+        components = suffix.split('.')
+
+        i = 0
+        while i < len(components):
+            comp = components[i].lower()
+
+            # Check for Ruby shorthand (a, b)
+            if comp in self.SHORTHAND_MAP:
+                i += 1
+            elif comp in self.STANDARD_SUFFIXES:
+                # Standard suffix - check if next component is a number
+                if i + 1 < len(components) and components[i + 1].isdigit():
+                    i += 2
+                else:
+                    i += 1
+            elif comp.isdigit():
+                # Standalone number - valid as patchlevel
+                i += 1
+            elif re.match(r'^([ab])(\d+)$', comp):
+                # Shorthand with number (a1 -> alpha1, b2 -> beta2)
+                i += 1
+            elif re.match(r'^([a-z]+)(\d+)$', comp):
+                # Combined suffix like 'alpha1', 'beta2'
+                m = re.match(r'^([a-z]+)(\d+)$', comp)
+                name = m.group(1)
+                if name in self.STANDARD_SUFFIXES:
+                    i += 1
+                else:
+                    # Non-standard suffix like 'racecar1'
+                    return False
+            else:
+                # Non-standard suffix
+                return False
+
+        return True
+
+
 # Register built-in filters
 RubyVersionFilterRegistry.register('ruby-compat', RubyCompatFilter)
 RubyVersionFilterRegistry.register('gem-source', GemSourceFilter)
 RubyVersionFilterRegistry.register('platform', PlatformFilter)
 RubyVersionFilterRegistry.register('pre-release', PreReleaseFilter)
+RubyVersionFilterRegistry.register('gentoo-version', GentooVersionFilter)

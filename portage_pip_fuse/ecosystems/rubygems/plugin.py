@@ -243,6 +243,80 @@ class RubyGemsMetadataProvider(MetadataProviderBase):
                         packages.add(name)
         return packages
 
+    def list_all_packages(self) -> Set[str]:
+        """
+        List all available gem names from RubyGems.org.
+
+        Fetches the full gem names list from https://index.rubygems.org/names
+        which is a plain text file with one gem name per line.
+
+        The result is cached to disk with a 24-hour TTL to avoid
+        repeatedly downloading the ~3MB names file.
+
+        Returns:
+            Set of all gem names available on RubyGems.org (~190k gems)
+        """
+        import time
+
+        # Cache file path for the names list
+        names_cache_path = self.cache_dir / '_all_names.txt'
+        names_cache_ttl = 86400  # 24 hours
+
+        # Check disk cache first
+        if names_cache_path.exists():
+            try:
+                cache_age = time.time() - names_cache_path.stat().st_mtime
+                if cache_age < names_cache_ttl:
+                    logger.debug(f"Using cached gem names list (age: {cache_age:.0f}s)")
+                    with names_cache_path.open('r') as f:
+                        return set(line.strip() for line in f if line.strip() and line.strip() != '---')
+            except OSError as e:
+                logger.warning(f"Failed to read gem names cache: {e}")
+
+        # Fetch from RubyGems index
+        logger.info("Fetching all gem names from RubyGems.org...")
+        names_url = "https://index.rubygems.org/names"
+
+        try:
+            from portage_pip_fuse.constants import HTTP_TIMEOUT
+            import urllib.request
+
+            req = urllib.request.Request(names_url)
+            req.add_header('User-Agent', 'portage-gem-fuse/0.1.0')
+
+            # HTTP_TIMEOUT is a tuple (connect, read) for requests library
+            # urllib uses a single timeout value, so use the read timeout
+            timeout = HTTP_TIMEOUT[1] if isinstance(HTTP_TIMEOUT, tuple) else HTTP_TIMEOUT
+
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                content = response.read().decode('utf-8')
+
+            # Parse the names list (skip the '---' header line)
+            names = set()
+            for line in content.splitlines():
+                line = line.strip()
+                if line and line != '---':
+                    names.add(line)
+
+            logger.info(f"Fetched {len(names)} gem names from RubyGems.org")
+
+            # Cache to disk
+            try:
+                temp_path = names_cache_path.with_suffix('.tmp')
+                with temp_path.open('w') as f:
+                    f.write('\n'.join(sorted(names)))
+                temp_path.rename(names_cache_path)
+                logger.debug(f"Cached gem names list to {names_cache_path}")
+            except OSError as e:
+                logger.warning(f"Failed to cache gem names list: {e}")
+
+            return names
+
+        except Exception as e:
+            logger.error(f"Failed to fetch gem names list: {e}")
+            # Fall back to cached packages if available
+            return self.list_packages()
+
 
 class RubyGemsEbuildGenerator(EbuildGeneratorBase):
     """
@@ -550,18 +624,61 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
         - 1.0.0.beta1 -> 1.0.0_beta1
         - 1.0.0.rc1 -> 1.0.0_rc1
         - 1.0.0.alpha -> 1.0.0_alpha
+        - 1.0.0.alpha.pre.4 -> 1.0.0_alpha_pre_p4 (standalone numbers become _p)
         """
         import re
 
-        version = gem_version
+        # Standard Gentoo suffix names
+        standard_suffixes = {'alpha', 'beta', 'pre', 'rc'}
 
-        # Replace pre-release markers
-        version = re.sub(r'\.pre(\d*)', r'_pre\1', version)
-        version = re.sub(r'\.beta(\d*)', r'_beta\1', version)
-        version = re.sub(r'\.alpha(\d*)', r'_alpha\1', version)
-        version = re.sub(r'\.rc(\d*)', r'_rc\1', version)
+        # Ruby shorthand -> Gentoo suffix (e.g., 5.a -> 5_alpha)
+        shorthand_map = {'a': 'alpha', 'b': 'beta'}
 
-        return version
+        # Split into base version and suffix
+        match = re.match(r'^(\d+(?:\.\d+)*)(.*)$', gem_version)
+        if not match:
+            return gem_version
+
+        base, suffix = match.groups()
+
+        if not suffix:
+            return base
+
+        # Parse suffix components
+        suffix = suffix.lstrip('.')
+        if not suffix:
+            return base
+
+        components = suffix.split('.')
+
+        # Build the Gentoo suffix
+        gentoo_suffix = ''
+        for comp in components:
+            comp_lower = comp.lower()
+
+            # Check for Ruby shorthand (a, b, a1, b2)
+            if comp_lower in shorthand_map:
+                gentoo_suffix += f'_{shorthand_map[comp_lower]}'
+            elif comp_lower in standard_suffixes:
+                gentoo_suffix += f'_{comp_lower}'
+            elif comp.isdigit():
+                # Standalone number - treat as patchlevel
+                gentoo_suffix += f'_p{comp}'
+            else:
+                # Check for shorthand with number (a1 -> alpha1, b2 -> beta2)
+                m = re.match(r'^([ab])(\d+)$', comp_lower)
+                if m:
+                    gentoo_suffix += f'_{shorthand_map[m.group(1)]}{m.group(2)}'
+                else:
+                    # Check for combined suffix like 'alpha1', 'beta2'
+                    m = re.match(r'^([a-z]+)(\d+)$', comp_lower)
+                    if m and m.group(1) in standard_suffixes:
+                        gentoo_suffix += f'_{m.group(1)}{m.group(2)}'
+                    else:
+                        # Non-standard suffix - keep as-is (may produce invalid version)
+                        gentoo_suffix += f'.{comp}'
+
+        return base + gentoo_suffix
 
     def _translate_license(self, licenses: List[str]) -> str:
         """

@@ -179,9 +179,19 @@ def _generate_virtual_ebuild(
     # Determine USE_RUBY
     use_ruby = "ruby32 ruby33"
 
-    # Build RDEPEND
+    # Build RDEPEND (skip platform-specific gems - Gentoo builds from source)
     rdepend_lines = []
+    seen_gems = set()  # Avoid duplicates when same gem appears with/without platform
     for gem in gems:
+        # Skip platform-specific gems
+        if gem.platform:
+            continue
+
+        # Skip duplicates
+        if gem.name in seen_gems:
+            continue
+        seen_gems.add(gem.name)
+
         gentoo_name = gem_to_gentoo(gem.name)
         if gem.version:
             version = _translate_gem_version(gem.version)
@@ -500,14 +510,24 @@ Examples:
     set_name = f"{project_name}-gems"
     set_path = set_dir / set_name
 
-    # Generate set content
+    # Generate set content (skip platform-specific gems - Gentoo builds from source)
     set_lines = [
         f"# Generated from {gemfile_lock}",
         f"# by portage-gem-fuse bundle install",
         ""
     ]
 
+    seen_gems = set()  # Avoid duplicates
     for gem in gems:
+        # Skip platform-specific gems
+        if gem.platform:
+            continue
+
+        # Skip duplicates
+        if gem.name in seen_gems:
+            continue
+        seen_gems.add(gem.name)
+
         gentoo_name = gem_to_gentoo(gem.name)
         if gem.version:
             version = _translate_gem_version(gem.version)

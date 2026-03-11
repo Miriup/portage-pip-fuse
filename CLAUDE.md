@@ -332,6 +332,37 @@ portage-gem-fuse unmount     # Unmount filesystem
 portage-gem-fuse install     # Create repos.conf
 portage-gem-fuse gem         # gem install translation
 portage-gem-fuse bundle      # bundle install translation (from Gemfile.lock)
+portage-gem-fuse debug       # Debug commands for inspecting gem metadata
+```
+
+### debug Subcommand
+
+The `debug` subcommand provides tools for inspecting RubyGems metadata and troubleshooting:
+
+```bash
+# Show available versions for a gem (semantically sorted)
+portage-gem-fuse debug versions <gem>
+portage-gem-fuse debug versions faraday
+
+# Show gem metadata (latest or specific version)
+portage-gem-fuse debug info <gem>
+portage-gem-fuse debug info rails --version 7.0.0
+
+# Show name translation (gem <-> Gentoo)
+portage-gem-fuse debug translate <name>
+portage-gem-fuse debug translate iso-639
+
+# Show which versions pass the filters (ruby-compat, platform, pre-release, source)
+portage-gem-fuse debug filter <gem>
+portage-gem-fuse debug filter nokogiri --use-ruby "ruby32 ruby33"
+
+# Show dependencies with Gentoo name translation
+portage-gem-fuse debug deps <gem>
+portage-gem-fuse debug deps rails
+
+# JSON output for scripting
+portage-gem-fuse debug info rails --json
+portage-gem-fuse debug versions faraday --json
 ```
 
 ### pip Subcommand Implementation
@@ -642,7 +673,16 @@ Supported sections:
 
 ### RubyGems Name Translation
 
-Gem names are translated to Gentoo package names:
+Gem names are used **exactly as specified** in RubyGems, with minimal transformations for PMS compatibility:
+
+1. **Underscores preserved**: Valid per PMS 3.1.2, distinguishes different gems:
+   - `devise-secure_password` → `dev-ruby/devise-secure_password`
+   - `devise-secure-password` → `dev-ruby/devise-secure-password`
+
+2. **Trailing digits fixed**: Names ending in `-NUMBER` conflict with version parsing:
+   - `iso-639` → `dev-ruby/iso639`
+
+3. **No heuristic matching**: Unlike previous versions, we do NOT try to match `ruby-foo` to `foo` or vice versa. Each gem gets its own package name.
 
 ```python
 from portage_pip_fuse.ecosystems.rubygems.name_translator import (
@@ -650,12 +690,15 @@ from portage_pip_fuse.ecosystems.rubygems.name_translator import (
 )
 
 translator = create_rubygems_translator()
-translator.rubygems_to_gentoo('activerecord')  # 'activerecord'
-translator.rubygems_to_gentoo('aws-sdk-s3')    # 'aws-sdk-s3'
-translator.gentoo_to_rubygems('rails')         # 'rails'
+translator.rubygems_to_gentoo('activerecord')          # 'activerecord'
+translator.rubygems_to_gentoo('ruby-debug')            # 'ruby-debug' (NOT 'debug')
+translator.rubygems_to_gentoo('debug')                 # 'debug'
+translator.rubygems_to_gentoo('iso-639')               # 'iso639' (trailing digits fixed)
 ```
 
-Known mappings for common gems are built-in, and the translator can preload existing `dev-ruby/*` packages from Gentoo repositories.
+**Handling mismatches**: When a gem name differs from an existing Gentoo package (e.g., Gentoo has `dev-ruby/foo` but the gem is `ruby-foo`), use the `.sys` patching mechanism to configure dependency mappings, similar to PyPI's approach with `sci-libs/torch`.
+
+Known mappings for Rails ecosystem gems (like `active_support` → `activesupport`) are built-in. Additional mappings are extracted from Gentoo's `metadata.xml` files.
 
 ### RubyGems Filters
 

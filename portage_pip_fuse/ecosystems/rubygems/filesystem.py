@@ -30,6 +30,7 @@ from .filters import (
     GemSourceFilter,
     PlatformFilter,
     PreReleaseFilter,
+    GentooVersionFilter,
     VersionFilterChain,
 )
 
@@ -139,6 +140,11 @@ class PortageGemFS(Operations):
 
         filters = []
 
+        # Gentoo version format filter (always enabled - non-translatable versions
+        # would produce invalid ebuild names)
+        if 'gentoo-version' not in disabled_filters:
+            filters.append(GentooVersionFilter())
+
         # Ruby compatibility filter
         if 'ruby-compat' not in disabled_filters:
             filters.append(RubyCompatFilter(use_ruby=self.use_ruby))
@@ -235,7 +241,12 @@ cache-formats = md5-dict
         return {'type': 'unknown'}
 
     def _gentoo_to_gem(self, gentoo_name: str) -> Optional[str]:
-        """Convert Gentoo package name to gem name."""
+        """
+        Convert Gentoo package name to gem name.
+
+        Since underscores are now preserved in Gentoo names, the translation
+        is straightforward - the Gentoo name matches the gem name.
+        """
         return self.name_translator.gentoo_to_rubygems(gentoo_name)
 
     def _get_package_versions(self, gem_name: str) -> List[str]:
@@ -269,8 +280,19 @@ cache-formats = md5-dict
                     gem_name, versions_metadata
                 )
 
-            # Sort versions (newest first)
-            versions = sorted(versions_metadata.keys(), reverse=True)
+            # Sort versions semantically (newest first)
+            # Handle non-PEP440 Ruby versions gracefully
+            from packaging.version import Version
+
+            def version_key(v):
+                try:
+                    # Valid versions get (1, Version) - higher priority
+                    return (1, Version(v))
+                except Exception:
+                    # Invalid/Ruby-style versions get (0, string) - appear at end
+                    return (0, v)
+
+            versions = sorted(versions_metadata.keys(), key=version_key, reverse=True)
 
             # Apply max_versions limit
             if self.max_versions > 0:
@@ -280,7 +302,8 @@ cache-formats = md5-dict
             gentoo_versions = []
             for v in versions:
                 gentoo_v = self._translate_gem_version(v)
-                gentoo_versions.append(gentoo_v)
+                if gentoo_v is not None:
+                    gentoo_versions.append(gentoo_v)
 
             # Cache the result
             self._versions_cache[cache_key] = (gentoo_versions, time.time())
@@ -291,7 +314,7 @@ cache-formats = md5-dict
             logger.error(f"Error getting versions for {gem_name}: {e}")
             return []
 
-    def _translate_gem_version(self, gem_version: str) -> str:
+    def _translate_gem_version(self, gem_version: str) -> Optional[str]:
         """
         Translate gem version string to Gentoo format.
 
@@ -300,6 +323,13 @@ cache-formats = md5-dict
         - .beta -> _beta
         - .pre -> _pre
         - .rc -> _rc
+
+        Handles compound suffixes (reversibly):
+        - .alpha.pre.4 -> _alpha_pre_p4 (standalone numbers become _p)
+        - .beta1.1 -> _beta1_p1
+        - .alpha.pre4 -> _alpha_pre4 (attached numbers stay attached)
+
+        Returns None for versions with non-standard suffixes.
 
         Examples:
             >>> fs = PortageGemFS.__new__(PortageGemFS)
@@ -315,16 +345,75 @@ cache-formats = md5-dict
             '5.0.0_pre'
             >>> fs._translate_gem_version('1.2.3.alpha')
             '1.2.3_alpha'
+            >>> fs._translate_gem_version('2.0.0.alpha.pre.4')
+            '2.0.0_alpha_pre_p4'
+            >>> fs._translate_gem_version('5.0.0.beta1.1')
+            '5.0.0_beta1_p1'
+            >>> fs._translate_gem_version('5.0.0.racecar1') is None
+            True
+            >>> fs._translate_gem_version('2.0.0.alpha.pre4')
+            '2.0.0_alpha_pre4'
         """
-        version = gem_version
+        # Standard Gentoo suffix names (excluding 'p' as it's only for patchlevel)
+        standard_suffixes = {'alpha', 'beta', 'pre', 'rc'}
 
-        # Replace pre-release markers
-        version = re.sub(r'\.alpha(\d*)', r'_alpha\1', version)
-        version = re.sub(r'\.beta(\d*)', r'_beta\1', version)
-        version = re.sub(r'\.pre(\d*)', r'_pre\1', version)
-        version = re.sub(r'\.rc(\d*)', r'_rc\1', version)
+        # Ruby shorthand -> Gentoo suffix (e.g., 5.a -> 5_alpha)
+        shorthand_map = {'a': 'alpha', 'b': 'beta'}
 
-        return version
+        # Split into base version (numbers.numbers...) and suffix
+        match = re.match(r'^(\d+(?:\.\d+)*)(.*)$', gem_version)
+        if not match:
+            return None
+
+        base, suffix = match.groups()
+
+        if not suffix:
+            return base  # Pure numeric version
+
+        # Parse suffix components
+        suffix = suffix.lstrip('.')
+        if not suffix:
+            return base
+
+        components = suffix.split('.')
+
+        # Build the Gentoo suffix
+        gentoo_suffix = ''
+        i = 0
+        while i < len(components):
+            comp = components[i].lower()
+
+            # Check for Ruby shorthand (a, b)
+            if comp in shorthand_map:
+                gentoo_suffix += f'_{shorthand_map[comp]}'
+                i += 1
+            elif comp in standard_suffixes:
+                gentoo_suffix += f'_{comp}'
+                i += 1
+            elif comp.isdigit():
+                # Standalone number - treat as patchlevel (_p)
+                gentoo_suffix += f'_p{comp}'
+                i += 1
+            elif re.match(r'^([ab])(\d+)$', comp):
+                # Shorthand with number (a1 -> alpha1, b2 -> beta2)
+                m = re.match(r'^([ab])(\d+)$', comp)
+                gentoo_suffix += f'_{shorthand_map[m.group(1)]}{m.group(2)}'
+                i += 1
+            elif re.match(r'^([a-z]+)(\d+)$', comp):
+                # Combined suffix like 'alpha1', 'beta2', 'pre4'
+                m = re.match(r'^([a-z]+)(\d+)$', comp)
+                name, num = m.groups()
+                if name in standard_suffixes:
+                    gentoo_suffix += f'_{name}{num}'
+                    i += 1
+                else:
+                    # Non-standard suffix
+                    return None
+            else:
+                # Non-standard suffix
+                return None
+
+        return base + gentoo_suffix
 
     def _gentoo_to_gem_version(self, gentoo_version: str) -> str:
         """
@@ -344,10 +433,20 @@ cache-formats = md5-dict
             '4.0.0.rc1'
             >>> fs._gentoo_to_gem_version('5.0.0_pre')
             '5.0.0.pre'
+            >>> fs._gentoo_to_gem_version('2.0.0_alpha_pre_p4')
+            '2.0.0.alpha.pre.4'
+            >>> fs._gentoo_to_gem_version('5.0.0_beta1_p1')
+            '5.0.0.beta1.1'
+            >>> fs._gentoo_to_gem_version('2.0.0_alpha_pre4')
+            '2.0.0.alpha.pre4'
         """
         version = gentoo_version
 
+        # Reverse the patchlevel suffix first (e.g., _p1 -> .1)
+        version = re.sub(r'_p(\d+)', r'.\1', version)
+
         # Reverse the pre-release marker translation
+        # Handle suffixes with and without numbers
         version = re.sub(r'_alpha(\d*)', r'.alpha\1', version)
         version = re.sub(r'_beta(\d*)', r'.beta\1', version)
         version = re.sub(r'_pre(\d*)', r'.pre\1', version)
@@ -387,9 +486,9 @@ cache-formats = md5-dict
 
         # Use the ebuild generator
         return self.ebuild_generator.generate_ebuild(
-            name=gem_name,
+            package_info=info,
             version=gem_version,
-            metadata=info
+            gentoo_name=gentoo_name
         )
 
     def _generate_minimal_ebuild(self, gentoo_name: str, gem_name: str, version: str) -> str:
@@ -633,20 +732,48 @@ KEYWORDS="~amd64 ~arm64"
         elif parsed['type'] == 'category' and parsed['category'] == 'dev-ruby':
             # Check cache first
             cache_key = 'dev-ruby'
+            use_cache = False
             if cache_key in self._category_cache:
                 cached_packages, timestamp = self._category_cache[cache_key]
                 if time.time() - timestamp < self.cache_ttl:
+                    logger.debug(f"Using cached package list ({len(cached_packages)} packages)")
                     entries.extend(cached_packages)
-                    return entries
-                del self._category_cache[cache_key]
+                    use_cache = True
+                else:
+                    del self._category_cache[cache_key]
 
-            # For now, return empty - packages will be looked up on demand
-            # A full implementation would list all gems from RubyGems
-            # which is impractical (700k+ gems)
-            logger.info("dev-ruby category listing requested - returning empty (use direct package access)")
+            if not use_cache:
+                # Fetch all gem names from RubyGems.org
+                try:
+                    start_time = time.time()
+                    logger.info("Listing all gems from RubyGems.org...")
 
-            # Cache empty result
-            self._category_cache[cache_key] = ([], time.time())
+                    # Get all gem names from the metadata provider
+                    gem_names = self.metadata_provider.list_all_packages()
+
+                    # Convert gem names to Gentoo names
+                    gentoo_packages = []
+                    for gem_name in gem_names:
+                        gentoo_name = self.name_translator.rubygems_to_gentoo(gem_name)
+                        if gentoo_name:
+                            gentoo_packages.append(gentoo_name)
+                        else:
+                            # Use gem name directly (normalized)
+                            gentoo_packages.append(gem_name.lower().replace('_', '-'))
+
+                    sorted_packages = sorted(gentoo_packages)
+
+                    # Cache the result
+                    self._category_cache[cache_key] = (sorted_packages, time.time())
+
+                    entries.extend(sorted_packages)
+
+                    elapsed = time.time() - start_time
+                    logger.info(f"Listed {len(gentoo_packages)} packages in {elapsed:.2f} seconds")
+
+                except Exception as e:
+                    logger.error(f"Error listing packages: {e}")
+                    logger.warning("Package listing failed, returning empty directory")
 
         elif parsed['type'] == 'package':
             # List versions and files for a package
