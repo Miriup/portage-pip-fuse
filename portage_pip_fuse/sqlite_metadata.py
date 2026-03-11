@@ -716,27 +716,31 @@ class SQLiteMetadataBackend:
     def ensure_database(self, force_download: bool = False) -> bool:
         """
         Ensure database is available and up-to-date.
-        
+
+        This method does NOT auto-download to avoid blocking FUSE operations.
+        Use sync_database() or pass force_download=True for explicit downloads.
+
         Args:
             force_download: Force download even if database exists
-            
+
         Returns:
             True if database is ready, False otherwise
         """
-        # Check if database is stale
-        if self._is_database_stale():
-            age_days = self._get_database_age_days()
-            if age_days is None:
-                logger.warning("No cached PyPI database found - downloading for first time")
-            else:
-                logger.warning(f"PyPI database is {age_days:.1f} days old (stale after {self.max_age_days} days)")
-                logger.warning("Newer package data may be available - consider running sync command")
-                
-        # Download if necessary
-        if force_download or self._is_database_stale():
+        # Only download when explicitly requested
+        if force_download:
             if not self._download_database(force_download):
                 return False
-                
+        elif self._is_database_stale():
+            # Warn but don't block on download
+            age_days = self._get_database_age_days()
+            if age_days is None:
+                logger.warning("No cached PyPI database found - run 'portage-pip-fuse sync' to download")
+                return False
+            else:
+                logger.warning(f"PyPI database is {age_days:.1f} days old (stale after {self.max_age_days} days)")
+                logger.warning("Consider running 'portage-pip-fuse sync' to update")
+                # Still try to connect to stale database - better than nothing
+
         # Connect to database
         return self._connect_database()
         

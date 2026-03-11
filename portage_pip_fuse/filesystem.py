@@ -2108,12 +2108,17 @@ cache-formats = md5-dict
 
             elif parsed['type'] == 'sys_append_package':
                 # /.sys/ebuild-append/dev-python/gevent - show versions
+                # IMPORTANT: Use cached versions only to prevent blocking
                 if self.append_patch_store is not None:
                     gentoo_name = parsed['package']
                     pypi_name = self._gentoo_to_pypi(gentoo_name)
                     if pypi_name:
-                        versions = self._get_package_versions(pypi_name)
-                        entries.extend(versions)
+                        # Check if versions are cached
+                        cache_key = f"versions_{pypi_name}"
+                        if cache_key in self._metadata_cache:
+                            versions, _ = self._metadata_cache[cache_key]
+                            entries.extend(versions)
+                        # else: versions not cached, return empty (user can cd directly)
                         entries.append('_all')  # Always show _all for global patches
 
             elif parsed['type'] == 'sys_append_version':
@@ -2170,12 +2175,17 @@ cache-formats = md5-dict
 
             elif parsed['type'] == 'sys_iuse_package':
                 # /.sys/iuse/dev-python/gevent - show versions
+                # IMPORTANT: Use cached versions only to prevent blocking
                 if self.iuse_patch_store is not None:
                     gentoo_name = parsed['package']
                     pypi_name = self._gentoo_to_pypi(gentoo_name)
                     if pypi_name:
-                        versions = self._get_package_versions(pypi_name)
-                        entries.extend(versions)
+                        # Check if versions are cached
+                        cache_key = f"versions_{pypi_name}"
+                        if cache_key in self._metadata_cache:
+                            versions, _ = self._metadata_cache[cache_key]
+                            entries.extend(versions)
+                        # else: versions not cached, return empty (user can cd directly)
                         entries.append('_all')  # Always show _all for global patches
 
             elif parsed['type'] == 'sys_iuse_version':
@@ -2232,12 +2242,17 @@ cache-formats = md5-dict
 
             elif parsed['type'] == 'sys_pep517_package':
                 # /.sys/pep517/dev-python/pypdf - show all versions + _all
+                # IMPORTANT: Use cached versions only to prevent blocking
                 if self.pep517_patch_store is not None:
                     gentoo_name = parsed['package']
                     pypi_name = self._gentoo_to_pypi(gentoo_name)
                     if pypi_name:
-                        versions = self._get_package_versions(pypi_name)
-                        entries.extend(versions)
+                        # Check if versions are cached
+                        cache_key = f"versions_{pypi_name}"
+                        if cache_key in self._metadata_cache:
+                            versions, _ = self._metadata_cache[cache_key]
+                            entries.extend(versions)
+                        # else: versions not cached, return empty (user can cd directly)
                         entries.append('_all')  # Always show _all for global patches
 
             elif parsed['type'] == 'sys_pep517_patch':

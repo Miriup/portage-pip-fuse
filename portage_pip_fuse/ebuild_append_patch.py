@@ -230,7 +230,12 @@ class EbuildAppendPatchStore:
                     for item in mp_data.get('ebuild_appends', []):
                         pp = PackageEbuildAppends.from_dict(item)
                         self.patches[pp.key] = pp
-                # If mount_point not found, we'll have empty patches (new namespace)
+                # Also check top-level ebuild_appends for backwards compatibility
+                # (file may have been partially migrated to v3)
+                if not self.patches and 'ebuild_appends' in data:
+                    for item in data.get('ebuild_appends', []):
+                        pp = PackageEbuildAppends.from_dict(item)
+                        self.patches[pp.key] = pp
             else:
                 # v1/v2/v3 legacy format: ebuild_appends at top level
                 for item in data.get('ebuild_appends', []):

@@ -18,6 +18,7 @@ Valid Backend Values:
 - meson-python   : meson-python backend
 - scikit-build-core : scikit-build-core backend
 - sip            : sip backend
+- uv-build       : uv build backend (note: hyphen, not underscore)
 - no             : Disable PEP517 (legacy setup.py)
 
 Patch File Format:
@@ -56,6 +57,7 @@ VALID_PEP517_BACKENDS = {
     'meson-python',
     'scikit-build-core',
     'sip',
+    'uv-build',         # uv build backend (note: hyphen, not underscore)
     'no',               # Disable PEP517
 }
 

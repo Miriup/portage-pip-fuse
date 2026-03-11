@@ -664,6 +664,7 @@ class PyPIMetadataExtractor:
             'maintainer': info.get('maintainer', ''),
             'maintainer_email': info.get('maintainer_email', ''),
             'license': info.get('license', ''),
+            'license_expression': info.get('license_expression', ''),
             'keywords': info.get('keywords', ''),
             'classifiers': info.get('classifiers', []),
             'dependencies': info.get('requires_dist', []),
@@ -1252,12 +1253,106 @@ class EbuildDataExtractor:
         self._compat_cache[cache_key] = result
         return result
     
-    def translate_license(self, pypi_license: str) -> str:
+    def _translate_spdx_expression(self, spdx_expr: str) -> str:
+        """
+        Translate SPDX license expression to Gentoo format.
+        
+        Handles basic SPDX expressions including OR and AND operators.
+        
+        Args:
+            spdx_expr: SPDX license expression (e.g., "Apache-2.0 OR BSD-2-Clause")
+            
+        Returns:
+            Gentoo-compatible license string or None if cannot translate
+            
+        Examples:
+            >>> extractor = EbuildDataExtractor()
+            >>> extractor._translate_spdx_expression('MIT')
+            'MIT'
+            >>> extractor._translate_spdx_expression('Apache-2.0 OR BSD-2-Clause')
+            '|| ( Apache-2.0 BSD-2 )'
+            >>> extractor._translate_spdx_expression('MIT AND Apache-2.0')
+            'MIT Apache-2.0'
+        """
+        if not spdx_expr:
+            return None
+            
+        # SPDX to Gentoo license mapping
+        spdx_to_gentoo = {
+            'MIT': 'MIT',
+            'Apache-2.0': 'Apache-2.0',
+            'BSD-2-Clause': 'BSD-2',
+            'BSD-3-Clause': 'BSD',
+            'GPL-2.0': 'GPL-2',
+            'GPL-2.0-only': 'GPL-2',
+            'GPL-2.0-or-later': 'GPL-2+',
+            'GPL-2.0+': 'GPL-2+',
+            'GPL-3.0': 'GPL-3',
+            'GPL-3.0-only': 'GPL-3',
+            'GPL-3.0-or-later': 'GPL-3+',
+            'GPL-3.0+': 'GPL-3+',
+            'LGPL-2.1': 'LGPL-2.1',
+            'LGPL-2.1-only': 'LGPL-2.1',
+            'LGPL-2.1-or-later': 'LGPL-2.1+',
+            'LGPL-2.1+': 'LGPL-2.1+',
+            'LGPL-3.0': 'LGPL-3',
+            'LGPL-3.0-only': 'LGPL-3',
+            'LGPL-3.0-or-later': 'LGPL-3+',
+            'LGPL-3.0+': 'LGPL-3+',
+            'ISC': 'ISC',
+            'MPL-2.0': 'MPL-2.0',
+            'CC0-1.0': 'CC0-1.0',
+            'Unlicense': 'Unlicense',
+            'Python-2.0': 'PSF-2',
+            'PSF-2.0': 'PSF-2',
+        }
+        
+        # Handle OR expressions (e.g., "Apache-2.0 OR BSD-2-Clause")
+        if ' OR ' in spdx_expr:
+            parts = [part.strip() for part in spdx_expr.split(' OR ')]
+            gentoo_parts = []
+            for part in parts:
+                gentoo_license = spdx_to_gentoo.get(part)
+                if gentoo_license:
+                    gentoo_parts.append(gentoo_license)
+                else:
+                    # If we can't translate any part, fall back to None
+                    return None
+            if gentoo_parts:
+                return f"|| ( {' '.join(gentoo_parts)} )"
+        
+        # Handle AND expressions (e.g., "MIT AND Apache-2.0")
+        elif ' AND ' in spdx_expr:
+            parts = [part.strip() for part in spdx_expr.split(' AND ')]
+            gentoo_parts = []
+            for part in parts:
+                gentoo_license = spdx_to_gentoo.get(part)
+                if gentoo_license:
+                    gentoo_parts.append(gentoo_license)
+                else:
+                    # If we can't translate any part, fall back to None
+                    return None
+            if gentoo_parts:
+                return ' '.join(gentoo_parts)
+        
+        # Single license
+        else:
+            spdx_clean = spdx_expr.strip()
+            if spdx_clean in spdx_to_gentoo:
+                return spdx_to_gentoo[spdx_clean]
+        
+        return None
+    
+    def translate_license(self, pypi_license: str, license_expression: str = '') -> str:
         """
         Translate PyPI license string to Gentoo license format.
         
+        Supports both old-style 'license' field and new PEP 639 'license_expression' field.
+        If license_expression is provided and valid, it takes precedence.
+        
         Args:
-            pypi_license: License string from PyPI metadata
+            pypi_license: License string from PyPI metadata 'license' field
+            license_expression: SPDX expression from 'license_expression' field (PEP 639)
             
         Returns:
             Gentoo-compatible license string
@@ -1268,6 +1363,10 @@ class EbuildDataExtractor:
             'MIT'
             >>> extractor.translate_license('Apache-2.0')
             'Apache-2.0'
+            >>> extractor.translate_license('', 'Apache-2.0')
+            'Apache-2.0'
+            >>> extractor.translate_license('', 'Apache-2.0 OR BSD-2-Clause')
+            '|| ( Apache-2.0 BSD-2 )'
             >>> extractor.translate_license('Unknown License')
             'all-rights-reserved'
             >>> extractor.translate_license('')
@@ -1285,6 +1384,13 @@ class EbuildDataExtractor:
             >>> extractor.translate_license('some weird mit license')
             'MIT'
         """
+        # Try license_expression first (PEP 639 - new style)
+        if license_expression:
+            gentoo_license = self._translate_spdx_expression(license_expression)
+            if gentoo_license:
+                return gentoo_license
+        
+        # Fall back to traditional license field
         if not pypi_license:
             return 'all-rights-reserved'
             
@@ -1993,7 +2099,10 @@ class EbuildDataExtractor:
             'PV': metadata.get('version', ''),
             'DESCRIPTION': metadata.get('summary', ''),
             'HOMEPAGE': metadata.get('homepage', ''),
-            'LICENSE': self.translate_license(metadata.get('license', '')),
+            'LICENSE': self.translate_license(
+                metadata.get('license', ''),
+                metadata.get('license_expression', '')
+            ),
 
             # PyPI eclass variables - use original case from filename
             'PYPI_PN': pypi_pn,
