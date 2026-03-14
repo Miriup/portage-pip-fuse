@@ -369,7 +369,12 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
 
         # Get dependencies
         rdepend = self._generate_dependencies(package_info, version, 'runtime')
-        bdepend = self._generate_dependencies(package_info, version, 'development')
+        dev_deps = self._generate_dependencies(package_info, version, 'development')
+
+        # Determine which USE flags are needed
+        iuse_flags = []
+        if dev_deps:
+            iuse_flags.append('debug')
 
         # Build ebuild
         lines = [
@@ -403,17 +408,24 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
             'KEYWORDS="~amd64 ~arm64"',
         ])
 
-        # Add dependencies
+        # Add IUSE if we have optional dependencies
+        if iuse_flags:
+            lines.append(f'IUSE="{" ".join(iuse_flags)}"')
+
+        # Add runtime dependencies
         if rdepend:
             lines.extend([
                 "",
                 f'RDEPEND="{rdepend}"',
             ])
 
-        if bdepend:
+        # Add development dependencies guarded by debug?
+        # These come from spec.add_development_dependency in the gemspec
+        if dev_deps:
+            bdepend_content = "debug? (\n\t\t" + dev_deps.replace('\n\t', '\n\t\t') + "\n\t)"
             lines.extend([
                 "",
-                f'BDEPEND="{bdepend}"',
+                f'BDEPEND="\n\t{bdepend_content}\n"',
             ])
 
         lines.append("")

@@ -679,8 +679,11 @@ Gem names are used **exactly as specified** in RubyGems, with minimal transforma
    - `devise-secure_password` → `dev-ruby/devise-secure_password`
    - `devise-secure-password` → `dev-ruby/devise-secure-password`
 
-2. **Trailing digits fixed**: Names ending in `-NUMBER` conflict with version parsing:
-   - `iso-639` → `dev-ruby/iso639`
+2. **Trailing digits fixed**: Names ending in `-NUMBER` conflict with version parsing.
+   Hyphen is replaced with underscore to avoid collisions with gems that already
+   have no hyphen (e.g., `http-2` vs `http2` are different gems):
+   - `iso-639` → `dev-ruby/iso_639`
+   - `http-2` → `dev-ruby/http_2` (distinct from `http2` → `dev-ruby/http2`)
 
 3. **No heuristic matching**: Unlike previous versions, we do NOT try to match `ruby-foo` to `foo` or vice versa. Each gem gets its own package name.
 
@@ -693,7 +696,8 @@ translator = create_rubygems_translator()
 translator.rubygems_to_gentoo('activerecord')          # 'activerecord'
 translator.rubygems_to_gentoo('ruby-debug')            # 'ruby-debug' (NOT 'debug')
 translator.rubygems_to_gentoo('debug')                 # 'debug'
-translator.rubygems_to_gentoo('iso-639')               # 'iso639' (trailing digits fixed)
+translator.rubygems_to_gentoo('iso-639')               # 'iso_639' (trailing digits fixed)
+translator.rubygems_to_gentoo('http-2')                # 'http_2' (distinct from 'http2')
 ```
 
 **Handling mismatches**: When a gem name differs from an existing Gentoo package (e.g., Gentoo has `dev-ruby/foo` but the gem is `ruby-foo`), use the `.sys` patching mechanism to configure dependency mappings, similar to PyPI's approach with `sci-libs/torch`.
