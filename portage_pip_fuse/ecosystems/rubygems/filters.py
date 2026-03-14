@@ -24,15 +24,10 @@ class RubyCompatFilter:
     against the system's USE_RUBY settings.
 
     Similar to Python's PYTHON_COMPAT filtering.
-    """
 
-    # Ruby versions currently supported in Gentoo
-    # Maps USE_RUBY flag to Ruby version string
-    RUBY_VERSIONS = {
-        'ruby32': '3.2',
-        'ruby33': '3.3',
-        'ruby34': '3.4',
-    }
+    Uses dynamic detection from ruby_targets module to get system
+    RUBY_TARGETS from Portage configuration.
+    """
 
     def __init__(self, use_ruby: Optional[List[str]] = None):
         """
@@ -40,40 +35,16 @@ class RubyCompatFilter:
 
         Args:
             use_ruby: List of USE_RUBY flags (e.g., ['ruby32', 'ruby33'])
-                     If None, detects from system USE_RUBY
+                     If None, detects from system RUBY_TARGETS
         """
-        self.use_ruby = use_ruby or self._detect_system_use_ruby()
+        from .ruby_targets import get_ruby_targets, ruby_impl_to_version
+
+        self.use_ruby = use_ruby or get_ruby_targets()
         self._ruby_versions = [
-            self.RUBY_VERSIONS[r] for r in self.use_ruby
-            if r in self.RUBY_VERSIONS
+            ruby_impl_to_version(r) for r in self.use_ruby
+            if ruby_impl_to_version(r) is not None
         ]
         logger.debug(f"Ruby compat filter using: {self._ruby_versions}")
-
-    def _detect_system_use_ruby(self) -> List[str]:
-        """Detect USE_RUBY from system configuration."""
-        # Check /etc/portage/make.conf or environment
-        use_ruby = os.environ.get('USE_RUBY', '')
-        if use_ruby:
-            return use_ruby.split()
-
-        # Try to read from make.conf
-        make_conf_paths = [
-            '/etc/portage/make.conf',
-            '/etc/make.conf',
-        ]
-
-        for conf_path in make_conf_paths:
-            try:
-                with open(conf_path, 'r') as f:
-                    content = f.read()
-                    match = re.search(r'^USE_RUBY=["\']?([^"\']+)["\']?', content, re.MULTILINE)
-                    if match:
-                        return match.group(1).split()
-            except FileNotFoundError:
-                continue
-
-        # Default to supported versions
-        return ['ruby32', 'ruby33']
 
     @classmethod
     def get_filter_name(cls) -> str:

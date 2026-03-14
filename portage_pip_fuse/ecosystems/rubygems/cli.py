@@ -176,8 +176,9 @@ def _generate_virtual_ebuild(
     Returns:
         Complete ebuild content
     """
-    # Determine USE_RUBY
-    use_ruby = "ruby32 ruby33"
+    # Determine USE_RUBY dynamically from eclass
+    from .ruby_targets import get_all_ruby_impls
+    use_ruby = ' '.join(get_all_ruby_impls())
 
     # Build RDEPEND (skip platform-specific gems - Gentoo builds from source)
     rdepend_lines = []

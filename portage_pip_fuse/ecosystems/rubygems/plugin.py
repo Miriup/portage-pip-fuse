@@ -327,9 +327,6 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
     the ruby-fakegem conventions.
     """
 
-    # Ruby versions currently in Gentoo
-    RUBY_VERSIONS = ['ruby32', 'ruby33']
-
     def __init__(
         self,
         cache_dir: Optional[str] = None,
@@ -473,28 +470,27 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
         The required_ruby_version from RubyGems is a version specifier like:
         - ">= 2.7.0"
         - ">= 2.5", "< 4"
+
+        Uses dynamic detection to get all Ruby implementations from
+        ruby-utils.eclass rather than a hardcoded list.
         """
+        from .ruby_targets import get_all_ruby_impls, ruby_impl_to_version
+
         required = package_info.get('required_ruby_version', '')
+        all_ruby_impls = get_all_ruby_impls()
 
         # Default to all supported versions if no requirement
         if not required or required == '>= 0':
-            return ' '.join(self.RUBY_VERSIONS)
+            return ' '.join(all_ruby_impls)
 
         # Parse version requirements
         compatible = []
-        for ruby_ver in self.RUBY_VERSIONS:
-            # Extract version number (e.g., "ruby32" -> "3.2")
-            if ruby_ver.startswith('ruby'):
-                ver_num = ruby_ver[4:]
-                major = ver_num[0]
-                minor = ver_num[1] if len(ver_num) > 1 else '0'
-                ruby_version = f"{major}.{minor}"
+        for ruby_impl in all_ruby_impls:
+            ruby_version = ruby_impl_to_version(ruby_impl)
+            if ruby_version and self._version_satisfies(ruby_version, required):
+                compatible.append(ruby_impl)
 
-                # Simple check - if ">= 2.7" and we're at 3.x, include it
-                if self._version_satisfies(ruby_version, required):
-                    compatible.append(ruby_ver)
-
-        return ' '.join(compatible) if compatible else ' '.join(self.RUBY_VERSIONS)
+        return ' '.join(compatible) if compatible else ' '.join(all_ruby_impls)
 
     def _version_satisfies(self, ruby_version: str, requirement: str) -> bool:
         """Check if a Ruby version satisfies a requirement."""
