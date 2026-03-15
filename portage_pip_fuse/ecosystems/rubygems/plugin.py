@@ -350,7 +350,13 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
         package_info: Dict[str, Any],
         version: str,
         gentoo_name: str,
-        slot_override: Optional[str] = None
+        slot_override: Optional[str] = None,
+        rdepend_patches: Optional[List] = None,
+        depend_patches: Optional[List] = None,
+        ruby_compat_patches: Optional[List] = None,
+        iuse_patches: Optional[List] = None,
+        ebuild_append: Optional[Dict[str, str]] = None,
+        git_source: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Generate ebuild content for a gem version.
 
@@ -359,6 +365,12 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
             version: Gem version string
             gentoo_name: Gentoo package name
             slot_override: Optional SLOT value override (default: "0")
+            rdepend_patches: List of RDEPEND dependency patches
+            depend_patches: List of DEPEND dependency patches
+            ruby_compat_patches: List of USE_RUBY compatibility patches
+            iuse_patches: List of IUSE patches
+            ebuild_append: Dict mapping phase names to code snippets
+            git_source: Git source configuration {'mode', 'url', 'pattern'}
         """
         # Extract info
         name = package_info.get('name', gentoo_name)
@@ -366,8 +378,8 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
         homepage = package_info.get('homepage_uri') or package_info.get('project_uri', '')
         licenses = self._translate_license(package_info.get('licenses', []))
 
-        # Get Ruby compatibility
-        use_ruby = self._generate_use_ruby(package_info)
+        # Get Ruby compatibility (with patches applied)
+        use_ruby = self._generate_use_ruby(package_info, ruby_compat_patches)
 
         # Check for native extensions
         extensions = package_info.get('extensions', [])
@@ -377,10 +389,15 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
         rdepend = self._generate_dependencies(package_info, version, 'runtime')
         dev_deps = self._generate_dependencies(package_info, version, 'development')
 
-        # Determine which USE flags are needed
+        # Apply dependency patches
+        rdepend = self._apply_dep_patches(rdepend, rdepend_patches)
+        depend = self._apply_dep_patches('', depend_patches)
+
+        # Determine which USE flags are needed (with patches applied)
         iuse_flags = []
         if dev_deps:
             iuse_flags.append('debug')
+        iuse_flags = self._apply_iuse_patches(iuse_flags, iuse_patches)
 
         # Determine KEYWORDS - empty for pre-releases (requires explicit keywording)
         is_prerelease = package_info.get('prerelease', False)
@@ -395,10 +412,19 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
                     is_prerelease = True
                     break
 
-        keywords = '' if is_prerelease else '~amd64 ~arm64'
+        # Git sources use empty KEYWORDS
+        if git_source and git_source.get('mode') == 'git':
+            keywords = ''
+        else:
+            keywords = '' if is_prerelease else '~amd64 ~arm64'
 
         # Use slot override if provided, otherwise default to "0"
         slot = slot_override if slot_override else "0"
+
+        # Determine eclasses to inherit
+        eclasses = ['ruby-fakegem']
+        if git_source and git_source.get('mode') == 'git':
+            eclasses.insert(0, 'git-r3')
 
         # Build ebuild
         lines = [
@@ -424,13 +450,31 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
             ext_list = ' '.join(extensions)
             lines.append(f'RUBY_FAKEGEM_EXTENSIONS=( {ext_list} )')
 
+        # Add git source variables
+        if git_source and git_source.get('mode') == 'git':
+            lines.append('')
+            git_url = git_source.get('url')
+            if git_url:
+                lines.append(f'EGIT_REPO_URI="{git_url}"')
+            tag_pattern = git_source.get('pattern', 'v${PV}')
+            lines.append(f'EGIT_COMMIT="{tag_pattern}"')
+
         lines.extend([
             "",
-            "inherit ruby-fakegem",
+            f'inherit {" ".join(eclasses)}',
             "",
             f'DESCRIPTION="{self._escape_string(description)}"',
             f'HOMEPAGE="{homepage}"',
-            f'SRC_URI="https://rubygems.org/gems/${{PN}}-${{PV}}.gem"',
+        ])
+
+        # SRC_URI depends on source type
+        if git_source and git_source.get('mode') == 'git':
+            # Git sources don't need SRC_URI
+            pass
+        else:
+            lines.append(f'SRC_URI="https://rubygems.org/gems/${{PN}}-${{PV}}.gem"')
+
+        lines.extend([
             "",
             f'LICENSE="{licenses}"',
             f'SLOT="{slot}"',
@@ -439,13 +483,20 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
 
         # Add IUSE if we have optional dependencies
         if iuse_flags:
-            lines.append(f'IUSE="{" ".join(iuse_flags)}"')
+            lines.append(f'IUSE="{" ".join(sorted(iuse_flags))}"')
 
         # Add runtime dependencies
         if rdepend:
             lines.extend([
                 "",
                 f'RDEPEND="{rdepend}"',
+            ])
+
+        # Add build dependencies
+        if depend:
+            lines.extend([
+                "",
+                f'DEPEND="{depend}"',
             ])
 
         # Add development dependencies guarded by debug?
@@ -457,8 +508,67 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
                 f'BDEPEND="\n\t{bdepend_content}\n"',
             ])
 
+        # Add phase functions from ebuild_append
+        if ebuild_append:
+            for phase, code in sorted(ebuild_append.items()):
+                lines.extend([
+                    "",
+                    f'{phase}() {{',
+                    f'\t{code}',
+                    '}',
+                ])
+
         lines.append("")
         return '\n'.join(lines)
+
+    def _apply_dep_patches(self, deps: str, patches: Optional[List]) -> str:
+        """Apply dependency patches to a dependency string."""
+        if not patches:
+            return deps
+
+        # Start with current deps as list
+        current_deps = [d.strip() for d in deps.split('\n\t') if d.strip()] if deps else []
+
+        for patch in patches:
+            op = patch.operation
+            if op == 'add':
+                # Add new dependency
+                if patch.new_dep and patch.new_dep not in current_deps:
+                    current_deps.append(patch.new_dep)
+            elif op == 'remove':
+                # Remove matching dependency
+                if patch.old_dep:
+                    current_deps = [d for d in current_deps if not d.startswith(patch.old_dep.split('[')[0])]
+            elif op == 'replace':
+                # Replace old with new
+                if patch.old_dep and patch.new_dep:
+                    for i, d in enumerate(current_deps):
+                        if d.startswith(patch.old_dep.split('[')[0]):
+                            current_deps[i] = patch.new_dep
+                            break
+                    else:
+                        # If old dep not found, just add new
+                        current_deps.append(patch.new_dep)
+
+        return '\n\t'.join(current_deps) if current_deps else ''
+
+    def _apply_iuse_patches(self, flags: List[str], patches: Optional[List]) -> List[str]:
+        """Apply IUSE patches to a list of USE flags."""
+        if not patches:
+            return flags
+
+        current = set(flags)
+
+        for patch in patches:
+            op = patch.operation
+            if op == 'add' and patch.flag:
+                current.add(patch.flag)
+            elif op == 'remove' and patch.flag:
+                current.discard(patch.flag)
+            elif op == 'set' and patch.flags:
+                current = set(patch.flags)
+
+        return list(current)
 
     def get_inherit_eclasses(self, package_info: Dict[str, Any]) -> List[str]:
         """Get list of eclasses to inherit."""
@@ -474,14 +584,14 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
         """Get the compatibility variable name."""
         return "USE_RUBY"
 
-    def generate_compat_declaration(self, package_info: Dict[str, Any]) -> str:
+    def generate_compat_declaration(self, package_info: Dict[str, Any], patches: Optional[List] = None) -> str:
         """Generate USE_RUBY declaration."""
-        use_ruby = self._generate_use_ruby(package_info)
+        use_ruby = self._generate_use_ruby(package_info, patches)
         return f'USE_RUBY="{use_ruby}"'
 
-    def _generate_use_ruby(self, package_info: Dict[str, Any]) -> str:
+    def _generate_use_ruby(self, package_info: Dict[str, Any], ruby_compat_patches: Optional[List] = None) -> str:
         """
-        Generate USE_RUBY value based on required_ruby_version.
+        Generate USE_RUBY value based on required_ruby_version with patches applied.
 
         The required_ruby_version from RubyGems is a version specifier like:
         - ">= 2.7.0"
@@ -489,6 +599,8 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
 
         Uses dynamic detection to get all Ruby implementations from
         ruby-utils.eclass rather than a hardcoded list.
+
+        Patches can add, remove, or replace the entire list of implementations.
         """
         from .ruby_targets import get_all_ruby_impls, ruby_impl_to_version
 
@@ -497,16 +609,32 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
 
         # Default to all supported versions if no requirement
         if not required or required == '>= 0':
-            return ' '.join(all_ruby_impls)
+            compatible = list(all_ruby_impls)
+        else:
+            # Parse version requirements
+            compatible = []
+            for ruby_impl in all_ruby_impls:
+                ruby_version = ruby_impl_to_version(ruby_impl)
+                if ruby_version and self._version_satisfies(ruby_version, required):
+                    compatible.append(ruby_impl)
 
-        # Parse version requirements
-        compatible = []
-        for ruby_impl in all_ruby_impls:
-            ruby_version = ruby_impl_to_version(ruby_impl)
-            if ruby_version and self._version_satisfies(ruby_version, required):
-                compatible.append(ruby_impl)
+            if not compatible:
+                compatible = list(all_ruby_impls)
 
-        return ' '.join(compatible) if compatible else ' '.join(all_ruby_impls)
+        # Apply patches
+        if ruby_compat_patches:
+            compatible_set = set(compatible)
+            for patch in ruby_compat_patches:
+                op = patch.operation
+                if op == 'add' and patch.impl:
+                    compatible_set.add(patch.impl)
+                elif op == 'remove' and patch.impl:
+                    compatible_set.discard(patch.impl)
+                elif op == 'set' and patch.impls:
+                    compatible_set = set(patch.impls)
+            compatible = sorted(compatible_set)
+
+        return ' '.join(compatible)
 
     def _version_satisfies(self, ruby_version: str, requirement: str) -> bool:
         """Check if a Ruby version satisfies a requirement."""

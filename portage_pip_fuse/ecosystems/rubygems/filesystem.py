@@ -25,6 +25,12 @@ from fuse import FUSE, FuseOSError, Operations
 
 from portage_pip_fuse.constants import DEFAULT_PATCH_FILE
 from portage_pip_fuse.slot_patch import SlotPatchStore, is_valid_slot
+from portage_pip_fuse.dependency_patch import DependencyPatchStore
+from portage_pip_fuse.iuse_patch import IUSEPatchStore, is_valid_use_flag
+from portage_pip_fuse.ebuild_append_patch import EbuildAppendPatchStore, is_valid_phase_name
+from portage_pip_fuse.git_source_patch import GitSourcePatchStore, is_valid_source_mode
+from portage_pip_fuse.name_translation_patch import NameTranslationPatchStore, is_valid_gentoo_atom
+from .ruby_compat_patch import RubyCompatPatchStore
 from .plugin import RubyGemsPlugin, RubyGemsMetadataProvider, RubyGemsEbuildGenerator
 from .name_translator import create_rubygems_translator
 from .filters import (
@@ -119,15 +125,42 @@ class PortageGemFS(Operations):
         # Set up version filters
         self.version_filter_chain = self._create_version_filter(filter_config or {})
 
-        # Initialize slot patch store
+        # Initialize patch stores
         if not no_patches:
             patch_path = patch_file or str(DEFAULT_PATCH_FILE)
+
+            # Slot override store
             self.slot_store = SlotPatchStore(patch_path, mount_point=mount_point)
-            logger.info(f"SLOT patching enabled, using {self.slot_store.storage_path}"
+
+            # Dependency patch stores (RDEPEND and DEPEND)
+            self.dep_patch_store = DependencyPatchStore(patch_path, mount_point=mount_point)
+
+            # Ruby compatibility store (USE_RUBY)
+            self.ruby_compat_store = RubyCompatPatchStore(patch_path, mount_point=mount_point)
+
+            # IUSE patch store
+            self.iuse_patch_store = IUSEPatchStore(patch_path, mount_point=mount_point)
+
+            # Ebuild append patch store (phase functions)
+            self.append_patch_store = EbuildAppendPatchStore(patch_path, mount_point=mount_point)
+
+            # Git source patch store
+            self.git_source_patch_store = GitSourcePatchStore(patch_path, mount_point=mount_point)
+
+            # Name translation store
+            self.name_translation_store = NameTranslationPatchStore(patch_path, mount_point=mount_point)
+
+            logger.info(f"Patching enabled, using {patch_path}"
                        + (f" (mount: {mount_point})" if mount_point else ""))
         else:
             self.slot_store = None
-            logger.info("SLOT patching disabled")
+            self.dep_patch_store = None
+            self.ruby_compat_store = None
+            self.iuse_patch_store = None
+            self.append_patch_store = None
+            self.git_source_patch_store = None
+            self.name_translation_store = None
+            logger.info("Patching disabled")
 
         # Static overlay structure
         self.static_dirs = {
@@ -137,8 +170,28 @@ class PortageGemFS(Operations):
             "/metadata",
             "/eclass",
             "/.sys",
+            # SLOT patching
             "/.sys/slot",
             "/.sys/slot/dev-ruby",
+            # RDEPEND/DEPEND patching
+            "/.sys/RDEPEND", "/.sys/RDEPEND/dev-ruby",
+            "/.sys/RDEPEND-patch", "/.sys/RDEPEND-patch/dev-ruby",
+            "/.sys/DEPEND", "/.sys/DEPEND/dev-ruby",
+            "/.sys/DEPEND-patch", "/.sys/DEPEND-patch/dev-ruby",
+            # Ruby compatibility
+            "/.sys/ruby-compat", "/.sys/ruby-compat/dev-ruby",
+            "/.sys/ruby-compat-patch", "/.sys/ruby-compat-patch/dev-ruby",
+            # IUSE
+            "/.sys/iuse", "/.sys/iuse/dev-ruby",
+            "/.sys/iuse-patch", "/.sys/iuse-patch/dev-ruby",
+            # Ebuild append
+            "/.sys/ebuild-append", "/.sys/ebuild-append/dev-ruby",
+            "/.sys/ebuild-append-patch", "/.sys/ebuild-append-patch/dev-ruby",
+            # Git source
+            "/.sys/git-source", "/.sys/git-source/dev-ruby",
+            "/.sys/git-source-patch", "/.sys/git-source-patch/dev-ruby",
+            # Name translation (global, not per-category)
+            "/.sys/name-translation",
         }
 
         # Static files
@@ -286,39 +339,167 @@ cache-formats = md5-dict
 
     def _parse_sys_path(self, parts: List[str]) -> Dict[str, str]:
         """
-        Parse .sys/ virtual filesystem paths for slot overrides.
+        Parse .sys/ virtual filesystem paths.
 
         Directory structure:
             .sys/
                 slot/
-                    dev-ruby/
-                        {package}/
-                            {version}     # file containing SLOT value (e.g., "2.0")
-                            _all          # override for all versions
+                    dev-ruby/{package}/{version}     # SLOT override
+                RDEPEND/
+                    dev-ruby/{package}/{version}     # Current RDEPEND list
+                RDEPEND-patch/
+                    dev-ruby/{package}/{version}.patch  # RDEPEND patches
+                DEPEND/
+                    dev-ruby/{package}/{version}     # Current DEPEND list
+                DEPEND-patch/
+                    dev-ruby/{package}/{version}.patch  # DEPEND patches
+                ruby-compat/
+                    dev-ruby/{package}/{version}/{impl}  # Current USE_RUBY
+                ruby-compat-patch/
+                    dev-ruby/{package}/{version}.patch   # USE_RUBY patches
+                iuse/
+                    dev-ruby/{package}/{version}/{flag}  # Current IUSE
+                iuse-patch/
+                    dev-ruby/{package}/{version}.patch   # IUSE patches
+                ebuild-append/
+                    dev-ruby/{package}/{version}/{phase} # Phase functions
+                ebuild-append-patch/
+                    dev-ruby/{package}/{version}.patch   # Phase patches
+                git-source/
+                    dev-ruby/{package}/{version}     # Git source config
+                git-source-patch/
+                    dev-ruby/{package}/{version}.patch   # Git source patches
+                name-translation/
+                    {pypi_name}                      # Name translation
         """
         if len(parts) == 1:
             # /.sys
             return {'type': 'sys_root'}
 
-        if parts[1] == 'slot':
-            if len(parts) == 2:
-                # /.sys/slot
-                return {'type': 'sys_slot'}
-            elif len(parts) == 3:
-                # /.sys/slot/dev-ruby
-                return {'type': 'sys_slot_category', 'category': parts[2]}
-            elif len(parts) == 4:
-                # /.sys/slot/dev-ruby/rails
-                return {'type': 'sys_slot_package', 'category': parts[2], 'package': parts[3]}
-            elif len(parts) == 5:
-                # /.sys/slot/dev-ruby/rails/7.0.0 or _all
-                return {
-                    'type': 'sys_slot_version',
-                    'category': parts[2],
-                    'package': parts[3],
-                    'version': parts[4]
-                }
+        control_type = parts[1]
 
+        # Slot overrides
+        if control_type == 'slot':
+            return self._parse_sys_path_standard(parts, 'slot')
+
+        # RDEPEND (view current dependencies)
+        if control_type == 'RDEPEND':
+            return self._parse_sys_path_standard(parts, 'rdepend')
+
+        # RDEPEND-patch (modify dependencies)
+        if control_type == 'RDEPEND-patch':
+            return self._parse_sys_path_patch(parts, 'rdepend_patch')
+
+        # DEPEND (view current build dependencies)
+        if control_type == 'DEPEND':
+            return self._parse_sys_path_standard(parts, 'depend')
+
+        # DEPEND-patch (modify build dependencies)
+        if control_type == 'DEPEND-patch':
+            return self._parse_sys_path_patch(parts, 'depend_patch')
+
+        # ruby-compat (view current USE_RUBY)
+        if control_type == 'ruby-compat':
+            return self._parse_sys_path_with_item(parts, 'ruby_compat')
+
+        # ruby-compat-patch (modify USE_RUBY)
+        if control_type == 'ruby-compat-patch':
+            return self._parse_sys_path_patch(parts, 'ruby_compat_patch')
+
+        # iuse (view current IUSE)
+        if control_type == 'iuse':
+            return self._parse_sys_path_with_item(parts, 'iuse')
+
+        # iuse-patch (modify IUSE)
+        if control_type == 'iuse-patch':
+            return self._parse_sys_path_patch(parts, 'iuse_patch')
+
+        # ebuild-append (view current phase functions)
+        if control_type == 'ebuild-append':
+            return self._parse_sys_path_with_item(parts, 'ebuild_append')
+
+        # ebuild-append-patch (modify phase functions)
+        if control_type == 'ebuild-append-patch':
+            return self._parse_sys_path_patch(parts, 'ebuild_append_patch')
+
+        # git-source (view current git source config)
+        if control_type == 'git-source':
+            return self._parse_sys_path_standard(parts, 'git_source')
+
+        # git-source-patch (modify git source config)
+        if control_type == 'git-source-patch':
+            return self._parse_sys_path_patch(parts, 'git_source_patch')
+
+        # name-translation (global, not per-category)
+        if control_type == 'name-translation':
+            if len(parts) == 2:
+                return {'type': 'sys_name_translation'}
+            elif len(parts) == 3:
+                return {'type': 'sys_name_translation_entry', 'pypi_name': parts[2]}
+
+        return {'type': 'invalid'}
+
+    def _parse_sys_path_standard(self, parts: List[str], base_type: str) -> Dict[str, str]:
+        """Parse standard .sys path: control/category/package/version."""
+        if len(parts) == 2:
+            return {'type': f'sys_{base_type}'}
+        elif len(parts) == 3:
+            return {'type': f'sys_{base_type}_category', 'category': parts[2]}
+        elif len(parts) == 4:
+            return {'type': f'sys_{base_type}_package', 'category': parts[2], 'package': parts[3]}
+        elif len(parts) == 5:
+            return {
+                'type': f'sys_{base_type}_version',
+                'category': parts[2],
+                'package': parts[3],
+                'version': parts[4]
+            }
+        return {'type': 'invalid'}
+
+    def _parse_sys_path_patch(self, parts: List[str], base_type: str) -> Dict[str, str]:
+        """Parse patch .sys path: control-patch/category/package/version.patch."""
+        if len(parts) == 2:
+            return {'type': f'sys_{base_type}'}
+        elif len(parts) == 3:
+            return {'type': f'sys_{base_type}_category', 'category': parts[2]}
+        elif len(parts) == 4:
+            return {'type': f'sys_{base_type}_package', 'category': parts[2], 'package': parts[3]}
+        elif len(parts) == 5:
+            version = parts[4]
+            # Strip .patch suffix if present
+            if version.endswith('.patch'):
+                version = version[:-6]
+            return {
+                'type': f'sys_{base_type}_version',
+                'category': parts[2],
+                'package': parts[3],
+                'version': version
+            }
+        return {'type': 'invalid'}
+
+    def _parse_sys_path_with_item(self, parts: List[str], base_type: str) -> Dict[str, str]:
+        """Parse .sys path with item level: control/category/package/version/item."""
+        if len(parts) == 2:
+            return {'type': f'sys_{base_type}'}
+        elif len(parts) == 3:
+            return {'type': f'sys_{base_type}_category', 'category': parts[2]}
+        elif len(parts) == 4:
+            return {'type': f'sys_{base_type}_package', 'category': parts[2], 'package': parts[3]}
+        elif len(parts) == 5:
+            return {
+                'type': f'sys_{base_type}_version',
+                'category': parts[2],
+                'package': parts[3],
+                'version': parts[4]
+            }
+        elif len(parts) == 6:
+            return {
+                'type': f'sys_{base_type}_item',
+                'category': parts[2],
+                'package': parts[3],
+                'version': parts[4],
+                'item': parts[5]
+            }
         return {'type': 'invalid'}
 
     def _gentoo_to_gem(self, gentoo_name: str) -> Optional[str]:
@@ -557,10 +738,8 @@ cache-formats = md5-dict
         # Get gem version (translate back from Gentoo format)
         gem_version = self._gentoo_to_gem_version(version)
 
-        # Check for slot override
-        slot_override = None
-        if self.slot_store:
-            slot_override = self.slot_store.get('dev-ruby', gentoo_name, version)
+        # Gather all patch data
+        patch_data = self._gather_patch_data('dev-ruby', gentoo_name, version)
 
         # Get version-specific metadata (includes correct dependencies for THIS version)
         info = self.metadata_provider.get_version_info(gem_name, gem_version)
@@ -571,15 +750,66 @@ cache-formats = md5-dict
 
         if not info:
             # Minimal ebuild if no metadata available
-            return self._generate_minimal_ebuild(gentoo_name, gem_name, version, slot_override)
+            return self._generate_minimal_ebuild(gentoo_name, gem_name, version, patch_data.get('slot_override'))
 
         # Use the ebuild generator
         return self.ebuild_generator.generate_ebuild(
             package_info=info,
             version=gem_version,
             gentoo_name=gentoo_name,
-            slot_override=slot_override
+            **patch_data
         )
+
+    def _gather_patch_data(self, category: str, package: str, version: str) -> Dict[str, Any]:
+        """Gather all patch data for a package version."""
+        patch_data: Dict[str, Any] = {}
+
+        # Slot override
+        if self.slot_store:
+            slot = self.slot_store.get(category, package, version)
+            if slot:
+                patch_data['slot_override'] = slot
+
+        # Dependency patches
+        if self.dep_patch_store:
+            rdepend_patches = [p for p in self.dep_patch_store.get_patches(category, package, version)
+                              if p.dep_type == 'rdepend']
+            depend_patches = [p for p in self.dep_patch_store.get_patches(category, package, version)
+                             if p.dep_type == 'depend']
+            if rdepend_patches:
+                patch_data['rdepend_patches'] = rdepend_patches
+            if depend_patches:
+                patch_data['depend_patches'] = depend_patches
+
+        # Ruby compatibility patches
+        if self.ruby_compat_store:
+            ruby_compat_patches = self.ruby_compat_store.get_patches(category, package, version)
+            if ruby_compat_patches:
+                patch_data['ruby_compat_patches'] = ruby_compat_patches
+
+        # IUSE patches
+        if self.iuse_patch_store:
+            iuse_patches = self.iuse_patch_store.get_patches(category, package, version)
+            if iuse_patches:
+                patch_data['iuse_patches'] = iuse_patches
+
+        # Ebuild append patches (phase functions)
+        if self.append_patch_store:
+            phases = self.append_patch_store.get_phases(category, package, version)
+            if phases:
+                patch_data['ebuild_append'] = phases
+
+        # Git source patches
+        if self.git_source_patch_store:
+            mode, url, pattern = self.git_source_patch_store.get_git_source(category, package, version)
+            if mode:
+                patch_data['git_source'] = {
+                    'mode': mode,
+                    'url': url,
+                    'pattern': pattern
+                }
+
+        return patch_data
 
     def _generate_minimal_ebuild(self, gentoo_name: str, gem_name: str, version: str,
                                    slot_override: Optional[str] = None) -> str:
@@ -738,9 +968,35 @@ KEYWORDS="{keywords}"
         uid = os.getuid()
         gid = os.getgid()
 
+        # Directory types for all .sys controls
+        sys_dir_types = (
+            'sys_root',
+            # slot
+            'sys_slot', 'sys_slot_category', 'sys_slot_package',
+            # rdepend
+            'sys_rdepend', 'sys_rdepend_category', 'sys_rdepend_package',
+            'sys_rdepend_patch', 'sys_rdepend_patch_category', 'sys_rdepend_patch_package',
+            # depend
+            'sys_depend', 'sys_depend_category', 'sys_depend_package',
+            'sys_depend_patch', 'sys_depend_patch_category', 'sys_depend_patch_package',
+            # ruby-compat
+            'sys_ruby_compat', 'sys_ruby_compat_category', 'sys_ruby_compat_package', 'sys_ruby_compat_version',
+            'sys_ruby_compat_patch', 'sys_ruby_compat_patch_category', 'sys_ruby_compat_patch_package',
+            # iuse
+            'sys_iuse', 'sys_iuse_category', 'sys_iuse_package', 'sys_iuse_version',
+            'sys_iuse_patch', 'sys_iuse_patch_category', 'sys_iuse_patch_package',
+            # ebuild-append
+            'sys_ebuild_append', 'sys_ebuild_append_category', 'sys_ebuild_append_package', 'sys_ebuild_append_version',
+            'sys_ebuild_append_patch', 'sys_ebuild_append_patch_category', 'sys_ebuild_append_patch_package',
+            # git-source
+            'sys_git_source', 'sys_git_source_category', 'sys_git_source_package',
+            'sys_git_source_patch', 'sys_git_source_patch_category', 'sys_git_source_patch_package',
+            # name-translation
+            'sys_name_translation',
+        )
+
         # Directory attributes
-        if parsed['type'] in ('root', 'profiles', 'metadata', 'eclass', 'category', 'package',
-                               'sys_root', 'sys_slot', 'sys_slot_category', 'sys_slot_package'):
+        if parsed['type'] in ('root', 'profiles', 'metadata', 'eclass', 'category', 'package') + sys_dir_types:
             return {
                 'st_mode': stat.S_IFDIR | 0o755,
                 'st_nlink': 2,
@@ -804,7 +1060,361 @@ KEYWORDS="{keywords}"
             # File doesn't exist yet but can be created
             raise FuseOSError(errno.ENOENT)
 
+        # Handle all other .sys file types
+        sys_file_result = self._getattr_sys_file(parsed, uid, gid, now)
+        if sys_file_result is not None:
+            return sys_file_result
+
         raise FuseOSError(errno.ENOENT)
+
+    def _getattr_sys_file(self, parsed: Dict, uid: int, gid: int, now: float) -> Optional[Dict]:
+        """Get attributes for .sys virtual files."""
+        ptype = parsed.get('type', '')
+
+        def file_attr(content_bytes):
+            return {
+                'st_mode': stat.S_IFREG | 0o644,
+                'st_nlink': 1,
+                'st_uid': uid,
+                'st_gid': gid,
+                'st_size': len(content_bytes),
+                'st_atime': now,
+                'st_mtime': now,
+                'st_ctime': now,
+            }
+
+        # RDEPEND/DEPEND patch files - always return valid attributes for writable files
+        if ptype in ('sys_rdepend_patch_version', 'sys_depend_patch_version'):
+            if self.dep_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                dep_type = 'rdepend' if 'rdepend' in ptype else 'depend'
+                patches = [p for p in self.dep_patch_store.get_patches(category, package, version)
+                           if p.dep_type == dep_type]
+                if patches:
+                    content = self.dep_patch_store.generate_patch_file(category, package, version)
+                    return file_attr(content.encode('utf-8'))
+                # Return empty file attributes for writable files that don't exist yet
+                return file_attr(b'')
+            return None
+
+        # Ruby-compat item files (individual implementation files)
+        if ptype == 'sys_ruby_compat_item':
+            if self.ruby_compat_store:
+                # Item is implementation name like 'ruby34'
+                # File exists if that impl is in the patched list
+                return file_attr(b'')
+            return None
+
+        # Ruby-compat patch files
+        if ptype == 'sys_ruby_compat_patch_version':
+            if self.ruby_compat_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                if self.ruby_compat_store.has_patches(category, package, version):
+                    content = self.ruby_compat_store.generate_patch_file(category, package, version)
+                    return file_attr(content.encode('utf-8'))
+                return file_attr(b'')
+            return None
+
+        # IUSE item files (individual USE flag files)
+        if ptype == 'sys_iuse_item':
+            if self.iuse_patch_store:
+                return file_attr(b'')
+            return None
+
+        # IUSE patch files
+        if ptype == 'sys_iuse_patch_version':
+            if self.iuse_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                if self.iuse_patch_store.has_patches(category, package, version):
+                    content = self.iuse_patch_store.generate_patch_file(category, package, version)
+                    return file_attr(content.encode('utf-8'))
+                return file_attr(b'')
+            return None
+
+        # Ebuild append item files (phase function files)
+        if ptype == 'sys_ebuild_append_item':
+            if self.append_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                phase = parsed['item']
+                content = self.append_patch_store.get_phase(category, package, version, phase)
+                if content:
+                    return file_attr((content + '\n').encode('utf-8'))
+            return None
+
+        # Ebuild append patch files
+        if ptype == 'sys_ebuild_append_patch_version':
+            if self.append_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                if self.append_patch_store.has_phases(category, package, version):
+                    content = self.append_patch_store.generate_patch_file(category, package, version)
+                    return file_attr(content.encode('utf-8'))
+                return file_attr(b'')
+            return None
+
+        # Git source version files
+        if ptype == 'sys_git_source_version':
+            if self.git_source_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                mode, url, pattern = self.git_source_patch_store.get_git_source(category, package, version)
+                if mode:
+                    content = self.git_source_patch_store.generate_patch_file(category, package, version)
+                    return file_attr(content.encode('utf-8'))
+                return file_attr(b'')
+            return None
+
+        # Git source patch files
+        if ptype == 'sys_git_source_patch_version':
+            if self.git_source_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                mode, _, _ = self.git_source_patch_store.get_git_source(category, package, version)
+                if mode:
+                    content = self.git_source_patch_store.generate_patch_file(category, package, version)
+                    return file_attr(content.encode('utf-8'))
+                return file_attr(b'')
+            return None
+
+        # Name translation entry files
+        if ptype == 'sys_name_translation_entry':
+            if self.name_translation_store:
+                pypi_name = parsed['pypi_name']
+                atom = self.name_translation_store.get_mapping(pypi_name)
+                if atom:
+                    return file_attr((atom + '\n').encode('utf-8'))
+                return file_attr(b'')
+            return None
+
+        return None
+
+    def _readdir_sys(self, parsed: Dict, entries: List[str]) -> None:
+        """Handle readdir for .sys virtual directories."""
+        ptype = parsed.get('type', '')
+
+        # Category-level directories (show 'dev-ruby')
+        category_types = (
+            'sys_rdepend', 'sys_rdepend_patch', 'sys_depend', 'sys_depend_patch',
+            'sys_ruby_compat', 'sys_ruby_compat_patch', 'sys_iuse', 'sys_iuse_patch',
+            'sys_ebuild_append', 'sys_ebuild_append_patch',
+            'sys_git_source', 'sys_git_source_patch',
+        )
+        if ptype in category_types:
+            entries.append('dev-ruby')
+            return
+
+        # Package-level directories (show packages with patches)
+        if ptype == 'sys_rdepend_patch_category' or ptype == 'sys_depend_patch_category':
+            if self.dep_patch_store:
+                dep_type = 'rdepend' if 'rdepend' in ptype else 'depend'
+                category = parsed['category']
+                packages = set()
+                for cat, pkg, ver in self.dep_patch_store.list_patched_packages():
+                    if cat == category:
+                        # Check if any patches are for this dep_type
+                        patches = self.dep_patch_store.get_patches(cat, pkg, ver)
+                        if any(p.dep_type == dep_type for p in patches):
+                            packages.add(pkg)
+                entries.extend(sorted(packages))
+            return
+
+        if ptype in ('sys_rdepend_category', 'sys_depend_category'):
+            # These show current deps - nothing to list unless we fetch from metadata
+            return
+
+        if ptype == 'sys_ruby_compat_patch_category':
+            if self.ruby_compat_store:
+                category = parsed['category']
+                packages = set()
+                for cat, pkg, ver in self.ruby_compat_store.list_patched_packages():
+                    if cat == category:
+                        packages.add(pkg)
+                entries.extend(sorted(packages))
+            return
+
+        if ptype == 'sys_ruby_compat_category':
+            # Show packages with ruby_compat patches
+            if self.ruby_compat_store:
+                category = parsed['category']
+                packages = set()
+                for cat, pkg, ver in self.ruby_compat_store.list_patched_packages():
+                    if cat == category:
+                        packages.add(pkg)
+                entries.extend(sorted(packages))
+            return
+
+        if ptype == 'sys_iuse_patch_category':
+            if self.iuse_patch_store:
+                category = parsed['category']
+                packages = set()
+                for cat, pkg, ver in self.iuse_patch_store.list_patched_packages():
+                    if cat == category:
+                        packages.add(pkg)
+                entries.extend(sorted(packages))
+            return
+
+        if ptype == 'sys_iuse_category':
+            if self.iuse_patch_store:
+                category = parsed['category']
+                packages = set()
+                for cat, pkg, ver in self.iuse_patch_store.list_patched_packages():
+                    if cat == category:
+                        packages.add(pkg)
+                entries.extend(sorted(packages))
+            return
+
+        if ptype == 'sys_ebuild_append_patch_category':
+            if self.append_patch_store:
+                category = parsed['category']
+                packages = set()
+                for cat, pkg, ver in self.append_patch_store.list_patched_packages():
+                    if cat == category:
+                        packages.add(pkg)
+                entries.extend(sorted(packages))
+            return
+
+        if ptype == 'sys_ebuild_append_category':
+            if self.append_patch_store:
+                category = parsed['category']
+                packages = set()
+                for cat, pkg, ver in self.append_patch_store.list_patched_packages():
+                    if cat == category:
+                        packages.add(pkg)
+                entries.extend(sorted(packages))
+            return
+
+        if ptype == 'sys_git_source_patch_category' or ptype == 'sys_git_source_category':
+            if self.git_source_patch_store:
+                category = parsed['category']
+                packages = set()
+                for cat, pkg, ver in self.git_source_patch_store.list_patched_packages():
+                    if cat == category:
+                        packages.add(pkg)
+                entries.extend(sorted(packages))
+            return
+
+        # Version-level (patch) directories
+        if ptype == 'sys_rdepend_patch_package' or ptype == 'sys_depend_patch_package':
+            if self.dep_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                versions = self.dep_patch_store.get_package_versions_with_patches(category, package)
+                entries.extend([v + '.patch' for v in versions])
+            return
+
+        if ptype == 'sys_ruby_compat_patch_package':
+            if self.ruby_compat_store:
+                category = parsed['category']
+                package = parsed['package']
+                versions = self.ruby_compat_store.get_package_versions_with_patches(category, package)
+                entries.extend([v + '.patch' for v in versions])
+            return
+
+        if ptype == 'sys_ruby_compat_package':
+            if self.ruby_compat_store:
+                category = parsed['category']
+                package = parsed['package']
+                versions = self.ruby_compat_store.get_package_versions_with_patches(category, package)
+                entries.extend(versions)
+            return
+
+        if ptype == 'sys_iuse_patch_package':
+            if self.iuse_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                versions = self.iuse_patch_store.get_package_versions_with_patches(category, package)
+                entries.extend([v + '.patch' for v in versions])
+            return
+
+        if ptype == 'sys_iuse_package':
+            if self.iuse_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                versions = self.iuse_patch_store.get_package_versions_with_patches(category, package)
+                entries.extend(versions)
+            return
+
+        if ptype == 'sys_ebuild_append_patch_package':
+            if self.append_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                versions = self.append_patch_store.get_package_versions_with_phases(category, package)
+                entries.extend([v + '.patch' for v in versions])
+            return
+
+        if ptype == 'sys_ebuild_append_package':
+            if self.append_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                versions = self.append_patch_store.get_package_versions_with_phases(category, package)
+                entries.extend(versions)
+            return
+
+        if ptype == 'sys_git_source_patch_package' or ptype == 'sys_git_source_package':
+            if self.git_source_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                versions = self.git_source_patch_store.get_package_versions_with_patches(category, package)
+                if 'patch' in ptype:
+                    entries.extend([v + '.patch' for v in versions])
+                else:
+                    entries.extend(versions)
+            return
+
+        # Version-level directories (show items)
+        if ptype == 'sys_ruby_compat_version':
+            # Show implementation files (ruby32, ruby33, etc.)
+            if self.ruby_compat_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                # Get patched implementations
+                patches = self.ruby_compat_store.get_patches(category, package, version)
+                impls = set()
+                for patch in patches:
+                    if patch.operation == 'add' and patch.impl:
+                        impls.add(patch.impl)
+                    elif patch.operation == 'set' and patch.impls:
+                        impls.update(patch.impls)
+                entries.extend(sorted(impls))
+            return
+
+        if ptype == 'sys_iuse_version':
+            # Show USE flag files
+            if self.iuse_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                flags = self.iuse_patch_store.get_current_flags(category, package, version)
+                entries.extend(sorted(flags))
+            return
+
+        if ptype == 'sys_ebuild_append_version':
+            # Show phase files (src_configure, etc.)
+            if self.append_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                phases = self.append_patch_store.get_phases(category, package, version)
+                entries.extend(sorted(phases.keys()))
+            return
+
+        # Name translation directory
+        if ptype == 'sys_name_translation':
+            if self.name_translation_store:
+                entries.extend(sorted(self.name_translation_store.list_mappings()))
+            return
 
     def _get_file_content(self, path: str, parsed: Dict) -> Optional[bytes]:
         """Get file content, using cache when available."""
@@ -853,7 +1463,12 @@ KEYWORDS="{keywords}"
             entries.extend(['dev-ruby', 'profiles', 'metadata', 'eclass', '.sys'])
 
         elif parsed['type'] == 'sys_root':
-            entries.append('slot')
+            entries.extend([
+                'slot', 'RDEPEND', 'RDEPEND-patch', 'DEPEND', 'DEPEND-patch',
+                'ruby-compat', 'ruby-compat-patch', 'iuse', 'iuse-patch',
+                'ebuild-append', 'ebuild-append-patch', 'git-source', 'git-source-patch',
+                'name-translation'
+            ])
 
         elif parsed['type'] == 'sys_slot':
             entries.append('dev-ruby')
@@ -875,6 +1490,10 @@ KEYWORDS="{keywords}"
                 category = parsed['category']
                 package = parsed['package']
                 entries.extend(sorted(self.slot_store.list_versions(category, package)))
+
+        # Handle other .sys directories
+        elif parsed['type'].startswith('sys_'):
+            self._readdir_sys(parsed, entries)
 
         elif parsed['type'] == 'profiles':
             entries.append('repo_name')
@@ -976,12 +1595,119 @@ KEYWORDS="{keywords}"
                     return content[offset:offset + length]
             raise FuseOSError(errno.ENOENT)
 
+        # Handle other .sys file reads
+        sys_content = self._read_sys_file(parsed)
+        if sys_content is not None:
+            return sys_content[offset:offset + length]
+
         content = self._get_file_content(path, parsed)
 
         if content is not None:
             return content[offset:offset + length]
 
         raise FuseOSError(errno.ENOENT)
+
+    def _read_sys_file(self, parsed: Dict) -> Optional[bytes]:
+        """Read content from .sys virtual files."""
+        ptype = parsed.get('type', '')
+
+        # RDEPEND/DEPEND patch files
+        if ptype in ('sys_rdepend_patch_version', 'sys_depend_patch_version'):
+            if self.dep_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                content = self.dep_patch_store.generate_patch_file(category, package, version)
+                if content:
+                    return content.encode('utf-8')
+            return None
+
+        # Ruby-compat patch files
+        if ptype == 'sys_ruby_compat_patch_version':
+            if self.ruby_compat_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                content = self.ruby_compat_store.generate_patch_file(category, package, version)
+                if content:
+                    return content.encode('utf-8')
+            return None
+
+        # Ruby-compat item files (individual impl)
+        if ptype == 'sys_ruby_compat_item':
+            # Just return empty content - the item exists if it's in directory listing
+            return b''
+
+        # IUSE patch files
+        if ptype == 'sys_iuse_patch_version':
+            if self.iuse_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                content = self.iuse_patch_store.generate_patch_file(category, package, version)
+                if content:
+                    return content.encode('utf-8')
+            return None
+
+        # IUSE item files (individual flags)
+        if ptype == 'sys_iuse_item':
+            return b''
+
+        # Ebuild append item files (phase functions)
+        if ptype == 'sys_ebuild_append_item':
+            if self.append_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                phase = parsed['item']
+                content = self.append_patch_store.get_phase(category, package, version, phase)
+                if content:
+                    return (content + '\n').encode('utf-8')
+            return None
+
+        # Ebuild append patch files
+        if ptype == 'sys_ebuild_append_patch_version':
+            if self.append_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                content = self.append_patch_store.generate_patch_file(category, package, version)
+                if content:
+                    return content.encode('utf-8')
+            return None
+
+        # Git source version files
+        if ptype == 'sys_git_source_version':
+            if self.git_source_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                content = self.git_source_patch_store.generate_patch_file(category, package, version)
+                if content:
+                    return content.encode('utf-8')
+            return None
+
+        # Git source patch files
+        if ptype == 'sys_git_source_patch_version':
+            if self.git_source_patch_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                content = self.git_source_patch_store.generate_patch_file(category, package, version)
+                if content:
+                    return content.encode('utf-8')
+            return None
+
+        # Name translation entry files
+        if ptype == 'sys_name_translation_entry':
+            if self.name_translation_store:
+                pypi_name = parsed['pypi_name']
+                atom = self.name_translation_store.get_mapping(pypi_name)
+                if atom:
+                    return (atom + '\n').encode('utf-8')
+            return None
+
+        return None
 
     def open(self, path, flags):
         """Open a file."""
@@ -1010,6 +1736,26 @@ KEYWORDS="{keywords}"
                     return 0
             raise FuseOSError(errno.ENOENT)
 
+        # Other .sys writable file types
+        writable_types = (
+            'sys_rdepend_patch_version', 'sys_depend_patch_version',
+            'sys_ruby_compat_patch_version', 'sys_ruby_compat_item',
+            'sys_iuse_patch_version', 'sys_iuse_item',
+            'sys_ebuild_append_patch_version', 'sys_ebuild_append_item',
+            'sys_git_source_version', 'sys_git_source_patch_version',
+            'sys_name_translation_entry',
+        )
+        if parsed['type'] in writable_types:
+            if (flags & os.O_WRONLY) or (flags & os.O_RDWR):
+                # Allow open for writing
+                return 0
+            # Read access - check if file exists via _read_sys_file
+            content = self._read_sys_file(parsed)
+            if content is not None:
+                return 0
+            # Allow opening for write even if doesn't exist
+            return 0
+
         raise FuseOSError(errno.ENOENT)
 
     def create(self, path, mode, fi=None):
@@ -1018,7 +1764,7 @@ KEYWORDS="{keywords}"
         parsed = self._parse_path(path)
         logger.info(f"create() parsed: {parsed}")
 
-        # Only allow creating slot override files
+        # Slot override files
         if parsed['type'] == 'sys_slot_version':
             if not self.slot_store:
                 raise FuseOSError(errno.EROFS)
@@ -1032,6 +1778,19 @@ KEYWORDS="{keywords}"
             # Use "0" as default since it's a valid slot
             self.slot_store.set(category, package, version, "0")
             logger.info(f"create() initialized slot for {category}/{package}/{version}")
+            return 0
+
+        # Allow creating patch files - actual content set via write()
+        creatable_types = (
+            'sys_rdepend_patch_version', 'sys_depend_patch_version',
+            'sys_ruby_compat_patch_version', 'sys_ruby_compat_item',
+            'sys_iuse_patch_version', 'sys_iuse_item',
+            'sys_ebuild_append_patch_version', 'sys_ebuild_append_item',
+            'sys_git_source_version', 'sys_git_source_patch_version',
+            'sys_name_translation_entry',
+        )
+        if parsed['type'] in creatable_types:
+            logger.info(f"create() allowing creation of {parsed['type']}")
             return 0
 
         raise FuseOSError(errno.EROFS)
@@ -1069,6 +1828,135 @@ KEYWORDS="{keywords}"
             except UnicodeDecodeError:
                 raise FuseOSError(errno.EINVAL)
 
+        # Handle other .sys writable types
+        return self._write_sys_file(parsed, data)
+
+    def _write_sys_file(self, parsed: Dict, data: bytes) -> int:
+        """Write content to .sys virtual files."""
+        ptype = parsed.get('type', '')
+
+        try:
+            content = data.decode('utf-8').strip()
+        except UnicodeDecodeError:
+            raise FuseOSError(errno.EINVAL)
+
+        if not content:
+            return len(data)  # Empty write - ignore
+
+        category = parsed.get('category', '')
+        package = parsed.get('package', '')
+        version = parsed.get('version', '')
+
+        # RDEPEND/DEPEND patch files
+        if ptype in ('sys_rdepend_patch_version', 'sys_depend_patch_version'):
+            if not self.dep_patch_store:
+                raise FuseOSError(errno.EROFS)
+            # Note: parse_patch_file defaults to 'rdepend' - for DEPEND patches,
+            # the patch lines should specify the type explicitly if needed
+            self.dep_patch_store.parse_patch_file(content, category, package, version)
+            self.dep_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            return len(data)
+
+        # Ruby-compat patch files
+        if ptype == 'sys_ruby_compat_patch_version':
+            if not self.ruby_compat_store:
+                raise FuseOSError(errno.EROFS)
+            self.ruby_compat_store.parse_patch_file(content, category, package, version)
+            self.ruby_compat_store.save()
+            self._invalidate_package_cache(category, package)
+            return len(data)
+
+        # Ruby-compat item (individual impl)
+        if ptype == 'sys_ruby_compat_item':
+            if not self.ruby_compat_store:
+                raise FuseOSError(errno.EROFS)
+            impl = parsed.get('item', '')
+            if not self.ruby_compat_store.is_valid_impl(impl):
+                logger.warning(f"Invalid Ruby implementation: {impl}")
+                raise FuseOSError(errno.EINVAL)
+            self.ruby_compat_store.add_impl(category, package, version, impl)
+            self.ruby_compat_store.save()
+            self._invalidate_package_cache(category, package)
+            return len(data)
+
+        # IUSE patch files
+        if ptype == 'sys_iuse_patch_version':
+            if not self.iuse_patch_store:
+                raise FuseOSError(errno.EROFS)
+            self.iuse_patch_store.parse_patch_file(content, category, package, version)
+            self.iuse_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            return len(data)
+
+        # IUSE item (individual flag)
+        if ptype == 'sys_iuse_item':
+            if not self.iuse_patch_store:
+                raise FuseOSError(errno.EROFS)
+            flag = parsed.get('item', '')
+            if not is_valid_use_flag(flag):
+                logger.warning(f"Invalid USE flag: {flag}")
+                raise FuseOSError(errno.EINVAL)
+            self.iuse_patch_store.add_flag(category, package, version, flag)
+            self.iuse_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            return len(data)
+
+        # Ebuild append item (phase function)
+        if ptype == 'sys_ebuild_append_item':
+            if not self.append_patch_store:
+                raise FuseOSError(errno.EROFS)
+            phase = parsed.get('item', '')
+            if not is_valid_phase_name(phase):
+                logger.warning(f"Invalid phase name: {phase}")
+                raise FuseOSError(errno.EINVAL)
+            self.append_patch_store.set_phase(category, package, version, phase, content)
+            self.append_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            return len(data)
+
+        # Ebuild append patch files
+        if ptype == 'sys_ebuild_append_patch_version':
+            if not self.append_patch_store:
+                raise FuseOSError(errno.EROFS)
+            self.append_patch_store.parse_patch_file(content, category, package, version)
+            self.append_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            return len(data)
+
+        # Git source version/patch files
+        if ptype in ('sys_git_source_version', 'sys_git_source_patch_version'):
+            if not self.git_source_patch_store:
+                raise FuseOSError(errno.EROFS)
+            # Parse git source config: "== git [url] [pattern]"
+            parts = content.split()
+            if len(parts) >= 2 and parts[0] == '==':
+                mode = parts[1]
+                if not is_valid_source_mode(mode):
+                    logger.warning(f"Invalid source mode: {mode}")
+                    raise FuseOSError(errno.EINVAL)
+                url = parts[2] if len(parts) > 2 else None
+                pattern = parts[3] if len(parts) > 3 else None
+                self.git_source_patch_store.set_git_source(category, package, version, mode, url, pattern)
+            else:
+                logger.warning(f"Invalid git source config format: {content}")
+                raise FuseOSError(errno.EINVAL)
+            self.git_source_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            return len(data)
+
+        # Name translation entry
+        if ptype == 'sys_name_translation_entry':
+            if not self.name_translation_store:
+                raise FuseOSError(errno.EROFS)
+            pypi_name = parsed.get('pypi_name', '')
+            if not is_valid_gentoo_atom(content):
+                logger.warning(f"Invalid Gentoo atom: {content}")
+                raise FuseOSError(errno.EINVAL)
+            self.name_translation_store.set_mapping(pypi_name, content)
+            self.name_translation_store.save()
+            return len(data)
+
         raise FuseOSError(errno.EROFS)
 
     def truncate(self, path, length, fh=None):
@@ -1079,6 +1967,18 @@ KEYWORDS="{keywords}"
         if parsed['type'] == 'sys_slot_version':
             if not self.slot_store:
                 raise FuseOSError(errno.EROFS)
+            return 0
+
+        # Allow truncate on all writable .sys files
+        writable_types = (
+            'sys_rdepend_patch_version', 'sys_depend_patch_version',
+            'sys_ruby_compat_patch_version', 'sys_ruby_compat_item',
+            'sys_iuse_patch_version', 'sys_iuse_item',
+            'sys_ebuild_append_patch_version', 'sys_ebuild_append_item',
+            'sys_git_source_version', 'sys_git_source_patch_version',
+            'sys_name_translation_entry',
+        )
+        if parsed['type'] in writable_types:
             return 0
 
         raise FuseOSError(errno.EROFS)
@@ -1101,6 +2001,102 @@ KEYWORDS="{keywords}"
                 self._invalidate_package_cache(category, package)
                 return 0
             raise FuseOSError(errno.ENOENT)
+
+        # Handle other .sys file removals
+        return self._unlink_sys_file(parsed)
+
+    def _unlink_sys_file(self, parsed: Dict) -> int:
+        """Remove .sys virtual files."""
+        ptype = parsed.get('type', '')
+        category = parsed.get('category', '')
+        package = parsed.get('package', '')
+        version = parsed.get('version', '')
+
+        # RDEPEND/DEPEND patch removal
+        if ptype in ('sys_rdepend_patch_version', 'sys_depend_patch_version'):
+            if not self.dep_patch_store:
+                raise FuseOSError(errno.EROFS)
+            dep_type = 'rdepend' if 'rdepend' in ptype else 'depend'
+            # Clear all patches for this version
+            self.dep_patch_store.clear_patches(category, package, version, dep_type)
+            self.dep_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            return 0
+
+        # Ruby-compat patch removal
+        if ptype == 'sys_ruby_compat_patch_version':
+            if not self.ruby_compat_store:
+                raise FuseOSError(errno.EROFS)
+            self.ruby_compat_store.clear_patches(category, package, version)
+            self.ruby_compat_store.save()
+            self._invalidate_package_cache(category, package)
+            return 0
+
+        # Ruby-compat item removal
+        if ptype == 'sys_ruby_compat_item':
+            if not self.ruby_compat_store:
+                raise FuseOSError(errno.EROFS)
+            impl = parsed.get('item', '')
+            self.ruby_compat_store.remove_impl(category, package, version, impl)
+            self.ruby_compat_store.save()
+            self._invalidate_package_cache(category, package)
+            return 0
+
+        # IUSE patch removal
+        if ptype == 'sys_iuse_patch_version':
+            if not self.iuse_patch_store:
+                raise FuseOSError(errno.EROFS)
+            self.iuse_patch_store.clear_patches(category, package, version)
+            self.iuse_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            return 0
+
+        # IUSE item removal
+        if ptype == 'sys_iuse_item':
+            if not self.iuse_patch_store:
+                raise FuseOSError(errno.EROFS)
+            flag = parsed.get('item', '')
+            self.iuse_patch_store.remove_flag(category, package, version, flag)
+            self.iuse_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            return 0
+
+        # Ebuild append item removal
+        if ptype == 'sys_ebuild_append_item':
+            if not self.append_patch_store:
+                raise FuseOSError(errno.EROFS)
+            phase = parsed.get('item', '')
+            self.append_patch_store.remove_phase(category, package, version, phase)
+            self.append_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            return 0
+
+        # Ebuild append patch removal
+        if ptype == 'sys_ebuild_append_patch_version':
+            if not self.append_patch_store:
+                raise FuseOSError(errno.EROFS)
+            self.append_patch_store.clear_phases(category, package, version)
+            self.append_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            return 0
+
+        # Git source removal
+        if ptype in ('sys_git_source_version', 'sys_git_source_patch_version'):
+            if not self.git_source_patch_store:
+                raise FuseOSError(errno.EROFS)
+            self.git_source_patch_store.remove_git_source(category, package, version)
+            self.git_source_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            return 0
+
+        # Name translation removal
+        if ptype == 'sys_name_translation_entry':
+            if not self.name_translation_store:
+                raise FuseOSError(errno.EROFS)
+            pypi_name = parsed.get('pypi_name', '')
+            self.name_translation_store.remove_mapping(pypi_name)
+            self.name_translation_store.save()
+            return 0
 
         raise FuseOSError(errno.EROFS)
 
@@ -1152,17 +2148,44 @@ KEYWORDS="{keywords}"
         if mode == os.R_OK:
             return 0
 
+        # All .sys directory types
+        sys_dir_types = (
+            'sys_root', 'sys_slot', 'sys_slot_category', 'sys_slot_package',
+            'sys_rdepend', 'sys_rdepend_category', 'sys_rdepend_package',
+            'sys_rdepend_patch', 'sys_rdepend_patch_category', 'sys_rdepend_patch_package',
+            'sys_depend', 'sys_depend_category', 'sys_depend_package',
+            'sys_depend_patch', 'sys_depend_patch_category', 'sys_depend_patch_package',
+            'sys_ruby_compat', 'sys_ruby_compat_category', 'sys_ruby_compat_package', 'sys_ruby_compat_version',
+            'sys_ruby_compat_patch', 'sys_ruby_compat_patch_category', 'sys_ruby_compat_patch_package',
+            'sys_iuse', 'sys_iuse_category', 'sys_iuse_package', 'sys_iuse_version',
+            'sys_iuse_patch', 'sys_iuse_patch_category', 'sys_iuse_patch_package',
+            'sys_ebuild_append', 'sys_ebuild_append_category', 'sys_ebuild_append_package', 'sys_ebuild_append_version',
+            'sys_ebuild_append_patch', 'sys_ebuild_append_patch_category', 'sys_ebuild_append_patch_package',
+            'sys_git_source', 'sys_git_source_category', 'sys_git_source_package',
+            'sys_git_source_patch', 'sys_git_source_patch_category', 'sys_git_source_patch_package',
+            'sys_name_translation',
+        )
+
+        # All .sys writable file types
+        sys_file_types = (
+            'sys_slot_version',
+            'sys_rdepend_patch_version', 'sys_depend_patch_version',
+            'sys_ruby_compat_patch_version', 'sys_ruby_compat_item',
+            'sys_iuse_patch_version', 'sys_iuse_item',
+            'sys_ebuild_append_patch_version', 'sys_ebuild_append_item',
+            'sys_git_source_version', 'sys_git_source_patch_version',
+            'sys_name_translation_entry',
+        )
+
         # Allow execute on directories
         if mode == os.X_OK:
-            if parsed['type'] in ('root', 'profiles', 'metadata', 'eclass', 'category', 'package',
-                                   'sys_root', 'sys_slot', 'sys_slot_category', 'sys_slot_package'):
+            if parsed['type'] in ('root', 'profiles', 'metadata', 'eclass', 'category', 'package') + sys_dir_types:
                 return 0
 
         # Allow write access to .sys paths (directories and files)
         if mode == os.W_OK:
-            if self.slot_store:
-                if parsed['type'] in ('sys_slot', 'sys_slot_category', 'sys_slot_package',
-                                       'sys_slot_version'):
+            if not self.no_patches:
+                if parsed['type'] in sys_dir_types + sys_file_types:
                     return 0
             raise FuseOSError(errno.EROFS)
 
