@@ -173,7 +173,10 @@ def _format_gentoo_atom(package_name: str, specifier=None) -> str:
             # Handle wildcard versions: PyPI ==23.* -> Gentoo =pkg-23*
             if version.endswith('.*'):
                 version = version[:-2] + '*'
-            dep_parts.append(f"=dev-python/{gentoo_name}-{version}")
+                dep_parts.append(f"=dev-python/{gentoo_name}-{version}")
+            else:
+                # Use ~ to match revision bumps (e.g., 1.0.0-r1)
+                dep_parts.append(f"~dev-python/{gentoo_name}-{version}")
         elif operator == '>=':
             dep_parts.append(f">=dev-python/{gentoo_name}-{version}")
         elif operator == '>':

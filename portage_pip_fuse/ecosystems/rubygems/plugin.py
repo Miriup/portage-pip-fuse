@@ -349,9 +349,17 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
         self,
         package_info: Dict[str, Any],
         version: str,
-        gentoo_name: str
+        gentoo_name: str,
+        slot_override: Optional[str] = None
     ) -> str:
-        """Generate ebuild content for a gem version."""
+        """Generate ebuild content for a gem version.
+
+        Args:
+            package_info: Package metadata from RubyGems API
+            version: Gem version string
+            gentoo_name: Gentoo package name
+            slot_override: Optional SLOT value override (default: "0")
+        """
         # Extract info
         name = package_info.get('name', gentoo_name)
         description = package_info.get('info', '')[:200]
@@ -389,6 +397,9 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
 
         keywords = '' if is_prerelease else '~amd64 ~arm64'
 
+        # Use slot override if provided, otherwise default to "0"
+        slot = slot_override if slot_override else "0"
+
         # Build ebuild
         lines = [
             "# Copyright 2026 Gentoo Authors",
@@ -402,6 +413,11 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
         # Add test recipe
         lines.append('RUBY_FAKEGEM_RECIPE_TEST="none"')
         lines.append('RUBY_FAKEGEM_RECIPE_DOC="none"')
+
+        # Don't install any executables by default - many gems have bin/setup or
+        # bin/console dev scripts that should NOT be installed to /usr/bin/.
+        # Gems with real CLI tools (rails, rspec, etc.) are in Gentoo main repo.
+        lines.append('RUBY_FAKEGEM_BINWRAP=""')
 
         # Add extensions if present
         if has_extensions:
@@ -417,7 +433,7 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
             f'SRC_URI="https://rubygems.org/gems/${{PN}}-${{PV}}.gem"',
             "",
             f'LICENSE="{licenses}"',
-            'SLOT="0"',
+            f'SLOT="{slot}"',
             f'KEYWORDS="{keywords}"',
         ])
 
@@ -633,7 +649,8 @@ class RubyGemsEbuildGenerator(EbuildGeneratorBase):
         elif op == '<':
             return f"<dev-ruby/{gentoo_name}-{gentoo_version}"
         elif op == '=' or op == '==':
-            return f"=dev-ruby/{gentoo_name}-{gentoo_version}"
+            # Use ~ to match revision bumps (e.g., 1.0.0-r1)
+            return f"~dev-ruby/{gentoo_name}-{gentoo_version}"
         elif op == '!=':
             return f"!=dev-ruby/{gentoo_name}-{gentoo_version}"
 

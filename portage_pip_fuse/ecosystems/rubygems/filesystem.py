@@ -23,6 +23,8 @@ from typing import Optional, Dict, List, Set, Tuple, Any
 
 from fuse import FUSE, FuseOSError, Operations
 
+from portage_pip_fuse.constants import DEFAULT_PATCH_FILE
+from portage_pip_fuse.slot_patch import SlotPatchStore, is_valid_slot
 from .plugin import RubyGemsPlugin, RubyGemsMetadataProvider, RubyGemsEbuildGenerator
 from .name_translator import create_rubygems_translator
 from .filters import (
@@ -64,7 +66,9 @@ class PortageGemFS(Operations):
         cache_dir: Optional[str] = None,
         filter_config: Optional[Dict] = None,
         mount_point: Optional[str] = None,
-        use_ruby: Optional[List[str]] = None
+        use_ruby: Optional[List[str]] = None,
+        patch_file: Optional[str] = None,
+        no_patches: bool = False
     ):
         """
         Initialize the RubyGems FUSE filesystem.
@@ -76,11 +80,14 @@ class PortageGemFS(Operations):
             filter_config: Version filter configuration dictionary
             mount_point: Mount point path for namespaced configuration
             use_ruby: List of USE_RUBY flags (e.g., ['ruby32', 'ruby33'])
+            patch_file: Path to patch file for slot/dependency overrides
+            no_patches: If True, disable the patching system entirely
         """
         self.root = root
         self.cache_ttl = cache_ttl
         self.mount_point = mount_point
         self.use_ruby = use_ruby or ['ruby32', 'ruby33']
+        self.no_patches = no_patches
 
         # Content cache: path -> (content, timestamp)
         self._content_cache: Dict[str, Tuple[bytes, float]] = {}
@@ -112,6 +119,16 @@ class PortageGemFS(Operations):
         # Set up version filters
         self.version_filter_chain = self._create_version_filter(filter_config or {})
 
+        # Initialize slot patch store
+        if not no_patches:
+            patch_path = patch_file or str(DEFAULT_PATCH_FILE)
+            self.slot_store = SlotPatchStore(patch_path, mount_point=mount_point)
+            logger.info(f"SLOT patching enabled, using {self.slot_store.storage_path}"
+                       + (f" (mount: {mount_point})" if mount_point else ""))
+        else:
+            self.slot_store = None
+            logger.info("SLOT patching disabled")
+
         # Static overlay structure
         self.static_dirs = {
             "/",
@@ -119,6 +136,9 @@ class PortageGemFS(Operations):
             "/profiles",
             "/metadata",
             "/eclass",
+            "/.sys",
+            "/.sys/slot",
+            "/.sys/slot/dev-ruby",
         }
 
         # Static files
@@ -210,12 +230,24 @@ cache-formats = md5-dict
             {'type': 'profiles_file', 'filename': 'repo_name'}
             >>> fs._parse_path('/metadata/layout.conf')
             {'type': 'metadata_file', 'filename': 'layout.conf'}
+            >>> fs._parse_path('/.sys/slot')
+            {'type': 'sys_slot'}
+            >>> fs._parse_path('/.sys/slot/dev-ruby')
+            {'type': 'sys_slot_category', 'category': 'dev-ruby'}
+            >>> fs._parse_path('/.sys/slot/dev-ruby/rails')
+            {'type': 'sys_slot_package', 'category': 'dev-ruby', 'package': 'rails'}
+            >>> fs._parse_path('/.sys/slot/dev-ruby/rails/_all')
+            {'type': 'sys_slot_version', 'category': 'dev-ruby', 'package': 'rails', 'version': '_all'}
         """
         path = path.strip('/')
         if not path:
             return {'type': 'root'}
 
         parts = path.split('/')
+
+        # Handle .sys virtual filesystem
+        if parts[0] == '.sys':
+            return self._parse_sys_path(parts)
 
         if parts[0] == 'profiles':
             if len(parts) == 1:
@@ -251,6 +283,43 @@ cache-formats = md5-dict
                     return {'type': 'ebuild', 'category': category, 'package': package, 'version': version, 'filename': filename}
 
         return {'type': 'unknown'}
+
+    def _parse_sys_path(self, parts: List[str]) -> Dict[str, str]:
+        """
+        Parse .sys/ virtual filesystem paths for slot overrides.
+
+        Directory structure:
+            .sys/
+                slot/
+                    dev-ruby/
+                        {package}/
+                            {version}     # file containing SLOT value (e.g., "2.0")
+                            _all          # override for all versions
+        """
+        if len(parts) == 1:
+            # /.sys
+            return {'type': 'sys_root'}
+
+        if parts[1] == 'slot':
+            if len(parts) == 2:
+                # /.sys/slot
+                return {'type': 'sys_slot'}
+            elif len(parts) == 3:
+                # /.sys/slot/dev-ruby
+                return {'type': 'sys_slot_category', 'category': parts[2]}
+            elif len(parts) == 4:
+                # /.sys/slot/dev-ruby/rails
+                return {'type': 'sys_slot_package', 'category': parts[2], 'package': parts[3]}
+            elif len(parts) == 5:
+                # /.sys/slot/dev-ruby/rails/7.0.0 or _all
+                return {
+                    'type': 'sys_slot_version',
+                    'category': parts[2],
+                    'package': parts[3],
+                    'version': parts[4]
+                }
+
+        return {'type': 'invalid'}
 
     def _gentoo_to_gem(self, gentoo_name: str) -> Optional[str]:
         """
@@ -488,6 +557,11 @@ cache-formats = md5-dict
         # Get gem version (translate back from Gentoo format)
         gem_version = self._gentoo_to_gem_version(version)
 
+        # Check for slot override
+        slot_override = None
+        if self.slot_store:
+            slot_override = self.slot_store.get('dev-ruby', gentoo_name, version)
+
         # Get version-specific metadata (includes correct dependencies for THIS version)
         info = self.metadata_provider.get_version_info(gem_name, gem_version)
 
@@ -497,16 +571,18 @@ cache-formats = md5-dict
 
         if not info:
             # Minimal ebuild if no metadata available
-            return self._generate_minimal_ebuild(gentoo_name, gem_name, version)
+            return self._generate_minimal_ebuild(gentoo_name, gem_name, version, slot_override)
 
         # Use the ebuild generator
         return self.ebuild_generator.generate_ebuild(
             package_info=info,
             version=gem_version,
-            gentoo_name=gentoo_name
+            gentoo_name=gentoo_name,
+            slot_override=slot_override
         )
 
-    def _generate_minimal_ebuild(self, gentoo_name: str, gem_name: str, version: str) -> str:
+    def _generate_minimal_ebuild(self, gentoo_name: str, gem_name: str, version: str,
+                                   slot_override: Optional[str] = None) -> str:
         """Generate minimal ebuild when metadata is unavailable."""
         gem_version = self._gentoo_to_gem_version(version)
         use_ruby = ' '.join(self.use_ruby)
@@ -523,6 +599,7 @@ cache-formats = md5-dict
                 break
 
         keywords = '' if is_prerelease else '~amd64 ~arm64'
+        slot = slot_override if slot_override else '0'
 
         return f'''# Copyright 2026 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
@@ -532,6 +609,7 @@ EAPI=8
 USE_RUBY="{use_ruby}"
 RUBY_FAKEGEM_RECIPE_TEST="none"
 RUBY_FAKEGEM_RECIPE_DOC="none"
+RUBY_FAKEGEM_BINWRAP=""
 
 inherit ruby-fakegem
 
@@ -540,7 +618,7 @@ HOMEPAGE="https://rubygems.org/gems/{gem_name}"
 SRC_URI="https://rubygems.org/gems/{gem_name}-{gem_version}.gem"
 
 LICENSE="MIT"
-SLOT="0"
+SLOT="{slot}"
 KEYWORDS="{keywords}"
 '''
 
@@ -649,6 +727,10 @@ KEYWORDS="{keywords}"
         """Get file attributes."""
         parsed = self._parse_path(path)
 
+        # Debug logging for .sys paths
+        if path.startswith('/.sys'):
+            logger.info(f"getattr() .sys path: {path} -> {parsed}")
+
         # Current time for timestamps
         now = time.time()
 
@@ -657,7 +739,8 @@ KEYWORDS="{keywords}"
         gid = os.getgid()
 
         # Directory attributes
-        if parsed['type'] in ('root', 'profiles', 'metadata', 'eclass', 'category', 'package'):
+        if parsed['type'] in ('root', 'profiles', 'metadata', 'eclass', 'category', 'package',
+                               'sys_root', 'sys_slot', 'sys_slot_category', 'sys_slot_package'):
             return {
                 'st_mode': stat.S_IFDIR | 0o755,
                 'st_nlink': 2,
@@ -698,6 +781,28 @@ KEYWORDS="{keywords}"
                     'st_mtime': now,
                     'st_ctime': now,
                 }
+
+        # Slot override files (writable)
+        if parsed['type'] == 'sys_slot_version':
+            if self.slot_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                slot = self.slot_store.get(category, package, version)
+                if slot is not None:
+                    content = (slot + '\n').encode('utf-8')
+                    return {
+                        'st_mode': stat.S_IFREG | 0o644,
+                        'st_nlink': 1,
+                        'st_uid': uid,
+                        'st_gid': gid,
+                        'st_size': len(content),
+                        'st_atime': now,
+                        'st_mtime': now,
+                        'st_ctime': now,
+                    }
+            # File doesn't exist yet but can be created
+            raise FuseOSError(errno.ENOENT)
 
         raise FuseOSError(errno.ENOENT)
 
@@ -745,7 +850,31 @@ KEYWORDS="{keywords}"
         entries = ['.', '..']
 
         if parsed['type'] == 'root':
-            entries.extend(['dev-ruby', 'profiles', 'metadata', 'eclass'])
+            entries.extend(['dev-ruby', 'profiles', 'metadata', 'eclass', '.sys'])
+
+        elif parsed['type'] == 'sys_root':
+            entries.append('slot')
+
+        elif parsed['type'] == 'sys_slot':
+            entries.append('dev-ruby')
+            # Also add categories that have slot overrides
+            if self.slot_store:
+                entries.extend(self.slot_store.list_categories())
+            # Deduplicate
+            entries = list(dict.fromkeys(entries))
+
+        elif parsed['type'] == 'sys_slot_category':
+            # List packages that have slot overrides in this category
+            if self.slot_store:
+                category = parsed['category']
+                entries.extend(sorted(self.slot_store.list_packages(category)))
+
+        elif parsed['type'] == 'sys_slot_package':
+            # List versions that have slot overrides for this package
+            if self.slot_store:
+                category = parsed['category']
+                package = parsed['package']
+                entries.extend(sorted(self.slot_store.list_versions(category, package)))
 
         elif parsed['type'] == 'profiles':
             entries.append('repo_name')
@@ -834,6 +963,19 @@ KEYWORDS="{keywords}"
 
         # Dynamic files
         parsed = self._parse_path(path)
+
+        # Slot override files
+        if parsed['type'] == 'sys_slot_version':
+            if self.slot_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                slot = self.slot_store.get(category, package, version)
+                if slot is not None:
+                    content = (slot + '\n').encode('utf-8')
+                    return content[offset:offset + length]
+            raise FuseOSError(errno.ENOENT)
+
         content = self._get_file_content(path, parsed)
 
         if content is not None:
@@ -852,7 +994,136 @@ KEYWORDS="{keywords}"
         if parsed['type'] in ('ebuild', 'package_metadata', 'manifest'):
             return 0
 
+        # Slot override files - allow open for both read and write
+        if parsed['type'] == 'sys_slot_version':
+            # Check if write access is requested
+            if (flags & os.O_WRONLY) or (flags & os.O_RDWR):
+                if not self.slot_store:
+                    raise FuseOSError(errno.EROFS)
+                return 0  # Allow open for writing
+            # Read access - check if file exists
+            if self.slot_store:
+                category = parsed['category']
+                package = parsed['package']
+                version = parsed['version']
+                if self.slot_store.get(category, package, version) is not None:
+                    return 0
+            raise FuseOSError(errno.ENOENT)
+
         raise FuseOSError(errno.ENOENT)
+
+    def create(self, path, mode, fi=None):
+        """Create a file."""
+        logger.info(f"create() called: path={path}, mode={mode}")
+        parsed = self._parse_path(path)
+        logger.info(f"create() parsed: {parsed}")
+
+        # Only allow creating slot override files
+        if parsed['type'] == 'sys_slot_version':
+            if not self.slot_store:
+                raise FuseOSError(errno.EROFS)
+
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+
+            # Initialize with a placeholder slot value so getattr finds the file
+            # The actual value will be set by write()
+            # Use "0" as default since it's a valid slot
+            self.slot_store.set(category, package, version, "0")
+            logger.info(f"create() initialized slot for {category}/{package}/{version}")
+            return 0
+
+        raise FuseOSError(errno.EROFS)
+
+    def write(self, path, data, offset, fh):
+        """Write to a file."""
+        parsed = self._parse_path(path)
+
+        if parsed['type'] == 'sys_slot_version':
+            if not self.slot_store:
+                raise FuseOSError(errno.EROFS)
+
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+
+            # Parse the slot value from the data
+            try:
+                slot = data.decode('utf-8').strip()
+                if not slot:
+                    # Empty write - ignore
+                    return len(data)
+
+                if not is_valid_slot(slot):
+                    logger.warning(f"Invalid SLOT value: {slot}")
+                    raise FuseOSError(errno.EINVAL)
+
+                self.slot_store.set(category, package, version, slot)
+                self.slot_store.save()
+
+                # Invalidate content cache for affected ebuilds
+                self._invalidate_package_cache(category, package)
+
+                return len(data)
+            except UnicodeDecodeError:
+                raise FuseOSError(errno.EINVAL)
+
+        raise FuseOSError(errno.EROFS)
+
+    def truncate(self, path, length, fh=None):
+        """Truncate a file."""
+        parsed = self._parse_path(path)
+
+        # Allow truncate on slot override files (for echo > file pattern)
+        if parsed['type'] == 'sys_slot_version':
+            if not self.slot_store:
+                raise FuseOSError(errno.EROFS)
+            return 0
+
+        raise FuseOSError(errno.EROFS)
+
+    def unlink(self, path):
+        """Remove a file."""
+        parsed = self._parse_path(path)
+
+        if parsed['type'] == 'sys_slot_version':
+            if not self.slot_store:
+                raise FuseOSError(errno.EROFS)
+
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+
+            if self.slot_store.remove(category, package, version):
+                self.slot_store.save()
+                # Invalidate content cache for affected ebuilds
+                self._invalidate_package_cache(category, package)
+                return 0
+            raise FuseOSError(errno.ENOENT)
+
+        raise FuseOSError(errno.EROFS)
+
+    def mkdir(self, path, mode):
+        """Create a directory."""
+        parsed = self._parse_path(path)
+
+        # Virtual .sys directories always exist - return EEXIST
+        if parsed['type'] in ('sys_root', 'sys_slot', 'sys_slot_category', 'sys_slot_package'):
+            raise FuseOSError(errno.EEXIST)
+
+        # Don't allow creating other directories
+        raise FuseOSError(errno.EROFS)
+
+    def _invalidate_package_cache(self, category: str, package: str):
+        """Invalidate content cache for a package's ebuilds."""
+        # Remove all cached content for this package
+        keys_to_remove = [
+            key for key in self._content_cache
+            if key.startswith(f"/{category}/{package}/")
+        ]
+        for key in keys_to_remove:
+            del self._content_cache[key]
 
     def release(self, path, fh):
         """Release an open file."""
@@ -883,11 +1154,16 @@ KEYWORDS="{keywords}"
 
         # Allow execute on directories
         if mode == os.X_OK:
-            if parsed['type'] in ('root', 'profiles', 'metadata', 'eclass', 'category', 'package'):
+            if parsed['type'] in ('root', 'profiles', 'metadata', 'eclass', 'category', 'package',
+                                   'sys_root', 'sys_slot', 'sys_slot_category', 'sys_slot_package'):
                 return 0
 
-        # Deny write access
+        # Allow write access to .sys paths (directories and files)
         if mode == os.W_OK:
+            if self.slot_store:
+                if parsed['type'] in ('sys_slot', 'sys_slot_category', 'sys_slot_package',
+                                       'sys_slot_version'):
+                    return 0
             raise FuseOSError(errno.EROFS)
 
         return 0
@@ -900,7 +1176,9 @@ def mount_rubygems_filesystem(
     cache_ttl: int = 3600,
     cache_dir: Optional[str] = None,
     filter_config: Optional[Dict] = None,
-    use_ruby: Optional[List[str]] = None
+    use_ruby: Optional[List[str]] = None,
+    patch_file: Optional[str] = None,
+    no_patches: bool = False
 ):
     """
     Mount the RubyGems FUSE filesystem.
@@ -913,6 +1191,8 @@ def mount_rubygems_filesystem(
         cache_dir: Cache directory for RubyGems metadata
         filter_config: Version filter configuration dictionary
         use_ruby: List of USE_RUBY flags (e.g., ['ruby32', 'ruby33'])
+        patch_file: Path to patch file for slot/dependency overrides
+        no_patches: If True, disable the patching system entirely
     """
     # Only configure logging if it hasn't been configured yet
     if not logging.getLogger().handlers:
@@ -927,7 +1207,10 @@ def mount_rubygems_filesystem(
         cache_dir=cache_dir,
         filter_config=filter_config,
         mount_point=mountpoint,
-        use_ruby=use_ruby
+        use_ruby=use_ruby,
+        patch_file=patch_file,
+        no_patches=no_patches
     )
 
-    FUSE(fs, mountpoint, nothreads=False, foreground=foreground, debug=debug, allow_other=True)
+    FUSE(fs, mountpoint, nothreads=False, foreground=foreground, debug=debug, allow_other=True,
+         entry_timeout=0, attr_timeout=0, negative_timeout=0)

@@ -1953,12 +1953,13 @@ class EbuildDataExtractor:
                     dep_parts.append(f"={gentoo_atom}-{version}")
                 else:
                     # PEP 440 considers 1.33 == 1.33.0, but Gentoo doesn't
-                    # Generate || ( =pkg-1.33 =pkg-1.33.0 ) to match either
+                    # Generate || ( ~pkg-1.33 ~pkg-1.33.0 ) to match either
+                    # Use ~ to also match revision bumps (e.g., 1.33-r1)
                     alt_version = self._get_pep440_equivalent_version(version)
                     if alt_version:
-                        dep_parts.append(f"|| ( ={gentoo_atom}-{version} ={gentoo_atom}-{alt_version} )")
+                        dep_parts.append(f"|| ( ~{gentoo_atom}-{version} ~{gentoo_atom}-{alt_version} )")
                     else:
-                        dep_parts.append(f"={gentoo_atom}-{version}")
+                        dep_parts.append(f"~{gentoo_atom}-{version}")
             elif operator == '>=':
                 # Normalize to shortest form so >=1.33.0 matches version 1.33
                 # (In Gentoo 1.33 < 1.33.0, but in PEP 440 they're equal)

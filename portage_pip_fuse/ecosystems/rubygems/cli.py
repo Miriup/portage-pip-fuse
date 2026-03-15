@@ -117,7 +117,8 @@ def _format_gentoo_atom(gem_name: str, version_constraint: Optional[str] = None)
         elif op == '<':
             atoms.append(f"<dev-ruby/{gentoo_name}-{gentoo_version}")
         elif op == '=' or op == '==':
-            atoms.append(f"=dev-ruby/{gentoo_name}-{gentoo_version}")
+            # Use ~ to match revision bumps (e.g., 1.0.0-r1)
+            atoms.append(f"~dev-ruby/{gentoo_name}-{gentoo_version}")
         elif op == '!=':
             atoms.append(f"!=dev-ruby/{gentoo_name}-{gentoo_version}")
 
@@ -196,7 +197,8 @@ def _generate_virtual_ebuild(
         gentoo_name = gem_to_gentoo(gem.name)
         if gem.version:
             version = _translate_gem_version(gem.version)
-            rdepend_lines.append(f"\t=dev-ruby/{gentoo_name}-{version}")
+            # Use ~ to match revision bumps (e.g., 1.0.0-r1)
+            rdepend_lines.append(f"\t~dev-ruby/{gentoo_name}-{version}")
         else:
             rdepend_lines.append(f"\tdev-ruby/{gentoo_name}")
 
@@ -248,7 +250,7 @@ def gem_command():
         epilog='''
 Examples:
   %(prog)s install rails                    # Translate to: emerge dev-ruby/rails
-  %(prog)s install rails -v 7.0.0           # emerge =dev-ruby/rails-7.0.0
+  %(prog)s install rails -v 7.0.0           # emerge ~dev-ruby/rails-7.0.0
   %(prog)s install --dry-run rails nokogiri # Show emerge command
         ''',
         formatter_class=argparse.RawDescriptionHelpFormatter
@@ -338,7 +340,8 @@ Examples:
         if args.version:
             version = _translate_gem_version(args.version)
             gentoo_name = gem_to_gentoo(gem)
-            emerge_cmd.append(f"=dev-ruby/{gentoo_name}-{version}")
+            # Use ~ to match revision bumps (e.g., 1.0.0-r1)
+            emerge_cmd.append(f"~dev-ruby/{gentoo_name}-{version}")
         else:
             gentoo_name = gem_to_gentoo(gem)
             emerge_cmd.append(f"dev-ruby/{gentoo_name}")
@@ -532,7 +535,8 @@ Examples:
         gentoo_name = gem_to_gentoo(gem.name)
         if gem.version:
             version = _translate_gem_version(gem.version)
-            set_lines.append(f"=dev-ruby/{gentoo_name}-{version}")
+            # Use ~ to match revision bumps (e.g., 1.0.0-r1)
+            set_lines.append(f"~dev-ruby/{gentoo_name}-{version}")
         else:
             set_lines.append(f"dev-ruby/{gentoo_name}")
 

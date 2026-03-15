@@ -31,6 +31,7 @@ from .pep517_patch import PEP517PatchStore, is_valid_pep517_backend, VALID_PEP51
 from .python_compat_patch import PythonCompatPatchStore
 from .name_translation_patch import NameTranslationPatchStore, is_valid_gentoo_atom
 from .git_source_patch import GitSourcePatchStore
+from .slot_patch import SlotPatchStore, is_valid_slot
 from .interrupt import InterruptChecker, check_interrupt
 from .prefetcher import create_prefetched_translator
 from .pip_metadata import PyPIMetadataExtractor, EbuildDataExtractor
@@ -198,6 +199,16 @@ class PortagePipFS(Operations):
             if not enable_git_source:
                 logger.info("Git source detection disabled")
 
+        # Initialize slot patch store (uses same file as other patches)
+        if not no_patches:
+            patch_path = patch_file or str(DEFAULT_PATCH_FILE)
+            self.slot_patch_store = SlotPatchStore(patch_path, mount_point=mount_point)
+            logger.info(f"SLOT patching enabled, using {self.slot_patch_store.storage_path}"
+                       + (f" (mount: {mount_point})" if mount_point else ""))
+        else:
+            self.slot_patch_store = None
+            logger.info("SLOT patching disabled")
+
         # Git worktree file content (stored in patches.json under mount point)
         self._git_file_content: Optional[bytes] = None
         if not no_patches:
@@ -246,7 +257,10 @@ class PortagePipFS(Operations):
             "/.sys/git-source",
             "/.sys/git-source/dev-python",
             "/.sys/git-source-patch",
-            "/.sys/git-source-patch/dev-python"
+            "/.sys/git-source-patch/dev-python",
+            # .sys virtual filesystem for SLOT overrides
+            "/.sys/slot",
+            "/.sys/slot/dev-python"
         }
         
         # Static files
@@ -757,6 +771,27 @@ cache-formats = md5-dict
             if len(parts) == 2:
                 return {'type': 'sys_git_file'}
             # .sys/.git/anything else is invalid
+            return {'type': 'invalid'}
+
+        elif parts[1] == 'slot':
+            # .sys/slot/ - SLOT value overrides
+            if len(parts) == 2:
+                # /.sys/slot
+                return {'type': 'sys_slot'}
+            elif len(parts) == 3:
+                # /.sys/slot/dev-python
+                return {'type': 'sys_slot_category', 'category': parts[2]}
+            elif len(parts) == 4:
+                # /.sys/slot/dev-python/package
+                return {'type': 'sys_slot_package', 'category': parts[2], 'package': parts[3]}
+            elif len(parts) == 5:
+                # /.sys/slot/dev-python/package/version or _all
+                return {
+                    'type': 'sys_slot_version',
+                    'category': parts[2],
+                    'package': parts[3],
+                    'version': parts[4]
+                }
             return {'type': 'invalid'}
 
         return {'type': 'invalid'}
@@ -1747,6 +1782,44 @@ cache-formats = md5-dict
                     'st_nlink': 1,
                     'st_size': len(gentoo_atom.encode('utf-8')) + 1,  # +1 for newline
                 })
+        # Handle .sys/slot/ virtual filesystem paths
+        elif parsed['type'] in ('sys_slot', 'sys_slot_category'):
+            # Static .sys/slot directories
+            attrs.update({
+                'st_mode': stat.S_IFDIR | 0o755,
+                'st_nlink': 2,
+                'st_size': 4096,
+            })
+        elif parsed['type'] == 'sys_slot_package':
+            # Dynamic .sys/slot package directories - verify package exists
+            if self.slot_patch_store is None:
+                raise FuseOSError(errno.ENOENT)
+            gentoo_name = parsed['package']
+            pypi_name = self._gentoo_to_pypi(gentoo_name)
+            if not pypi_name or not self._package_exists(pypi_name):
+                raise FuseOSError(errno.ENOENT)
+            attrs.update({
+                'st_mode': stat.S_IFDIR | 0o755,
+                'st_nlink': 2,
+                'st_size': 4096,
+            })
+        elif parsed['type'] == 'sys_slot_version':
+            # Version file in .sys/slot/.../version - contains SLOT value
+            if self.slot_patch_store is None:
+                raise FuseOSError(errno.ENOENT)
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+            slot = self.slot_patch_store.get(category, package, version)
+            if slot is None:
+                # No slot override yet - return ENOENT (file doesn't exist)
+                raise FuseOSError(errno.ENOENT)
+            else:
+                attrs.update({
+                    'st_mode': stat.S_IFREG | 0o644,
+                    'st_nlink': 1,
+                    'st_size': len(slot.encode('utf-8')) + 1,  # +1 for newline
+                })
         # Handle .sys/.git worktree file
         elif parsed['type'] == 'sys_git_file':
             content = self._get_git_file_content()
@@ -1883,6 +1956,8 @@ cache-formats = md5-dict
                     entries.extend(['pep517', 'pep517-patch', 'pep517-default'])
                 if self.name_translation_store is not None:
                     entries.append('name-translation')
+                if self.slot_patch_store is not None:
+                    entries.append('slot')
                 # Show .git file if it exists (for git worktree support)
                 if self._get_git_file_content() is not None:
                     entries.append('.git')
@@ -2281,6 +2356,29 @@ cache-formats = md5-dict
                 if self.name_translation_store is not None:
                     entries.extend(self.name_translation_store.list_mappings())
 
+            # Handle .sys/slot/ directories
+            elif parsed['type'] == 'sys_slot':
+                # /.sys/slot - show categories
+                if self.slot_patch_store is not None:
+                    entries.append('dev-python')
+                    # Also add any categories that have overrides
+                    entries.extend(self.slot_patch_store.list_categories())
+                    # Deduplicate
+                    entries = list(dict.fromkeys(entries))
+
+            elif parsed['type'] == 'sys_slot_category':
+                # /.sys/slot/dev-python - show packages with slot overrides
+                if self.slot_patch_store is not None:
+                    category = parsed['category']
+                    entries.extend(sorted(self.slot_patch_store.list_packages(category)))
+
+            elif parsed['type'] == 'sys_slot_package':
+                # /.sys/slot/dev-python/package - show versions with slot overrides
+                if self.slot_patch_store is not None:
+                    category = parsed['category']
+                    package = parsed['package']
+                    entries.extend(sorted(self.slot_patch_store.list_versions(category, package)))
+
         except InterruptedError:
             logger.info(f"readdir interrupted for {path}")
             # Return minimal result on interrupt
@@ -2424,6 +2522,20 @@ cache-formats = md5-dict
                 # No mapping yet - return empty content
                 return b''
             content = (gentoo_atom + '\n').encode('utf-8')
+            return content[offset:offset + length]
+
+        # Handle .sys/slot/ file reads
+        elif parsed['type'] == 'sys_slot_version':
+            # Read a SLOT override file - return the slot value
+            if self.slot_patch_store is None:
+                raise FuseOSError(errno.ENOENT)
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+            slot = self.slot_patch_store.get(category, package, version)
+            if slot is None:
+                raise FuseOSError(errno.ENOENT)
+            content = (slot + '\n').encode('utf-8')
             return content[offset:offset + length]
 
         # Handle .sys/.git file read
@@ -2643,6 +2755,12 @@ cache-formats = md5-dict
                 iuse = ebuild_data.get('IUSE', [])
                 iuse = self.iuse_patch_store.apply_patches(category, package, version, iuse)
                 ebuild_data['IUSE'] = iuse
+
+            # Apply SLOT override if enabled
+            if self.slot_patch_store is not None:
+                slot_override = self.slot_patch_store.get(category, package, version)
+                if slot_override:
+                    ebuild_data['SLOT'] = slot_override
 
             # Generate ebuild from template
             return self._format_ebuild(ebuild_data, category, package, version)
@@ -3186,6 +3304,14 @@ cache-formats = md5-dict
             # Just allow creation - actual content set via write()
             return 0
 
+        if parsed['type'] == 'sys_slot_version':
+            # touch /.sys/slot/dev-python/pkg/_all
+            # Creates a SLOT override file - content will be set via write()
+            if self.slot_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+            # Just allow creation - actual content set via write()
+            return 0
+
         raise FuseOSError(errno.EROFS)
 
     def unlink(self, path):
@@ -3307,6 +3433,22 @@ cache-formats = md5-dict
             if not self.name_translation_store.remove_mapping(pypi_name):
                 raise FuseOSError(errno.ENOENT)
             logger.info(f"Removed name translation mapping via rm: {pypi_name}")
+            return
+
+        if parsed['type'] == 'sys_slot_version':
+            # rm /.sys/slot/dev-python/pkg/_all
+            if self.slot_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+
+            if not self.slot_patch_store.remove(category, package, version):
+                raise FuseOSError(errno.ENOENT)
+            self.slot_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            logger.info(f"Removed SLOT override via rm: {category}/{package}/{version}")
             return
 
         raise FuseOSError(errno.EROFS)
@@ -3545,6 +3687,32 @@ cache-formats = md5-dict
 
             return len(data)
 
+        if parsed['type'] == 'sys_slot_version':
+            # echo "2.0" > /.sys/slot/dev-python/pkg/_all
+            if self.slot_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+
+            category = parsed['category']
+            package = parsed['package']
+            version = parsed['version']
+
+            # Decode and validate slot value
+            slot = data.decode('utf-8', errors='replace').strip()
+            if not slot:
+                # Empty write - ignore
+                return len(data)
+
+            if not is_valid_slot(slot):
+                logger.warning(f"Invalid SLOT value: {slot}")
+                raise FuseOSError(errno.EINVAL)
+
+            self.slot_patch_store.set(category, package, version, slot)
+            self.slot_patch_store.save()
+            self._invalidate_package_cache(category, package)
+            logger.info(f"Set SLOT override: {slot} for {category}/{package}/{version}")
+
+            return len(data)
+
         raise FuseOSError(errno.EROFS)
 
     def truncate(self, path, length, fh=None):
@@ -3684,6 +3852,14 @@ cache-formats = md5-dict
                 self.name_translation_store.remove_mapping(pypi_name)
                 # Invalidate all cached ebuilds since name translations affect RDEPEND
                 self._content_cache.clear()
+            return
+
+        if parsed['type'] == 'sys_slot_version':
+            # Support truncate for SLOT override files
+            if self.slot_patch_store is None:
+                raise FuseOSError(errno.EROFS)
+
+            # truncate is typically used before write, just allow it
             return
 
         raise FuseOSError(errno.EROFS)
