@@ -523,17 +523,28 @@ cache-formats = md5-dict
             del self._versions_cache[cache_key]
 
         try:
-            versions_data = self.metadata_provider.get_package_versions(gem_name)
+            # Use get_versions_metadata to get full version info including platform
+            versions_data = self.metadata_provider.get_versions_metadata(gem_name)
             if not versions_data:
                 return []
 
             # Convert to dict format for filtering
+            # When multiple platforms exist for the same version, prefer 'ruby' (pure Ruby)
+            # over platform-specific builds, as it's universal
             versions_metadata = {}
             for v in versions_data:
                 if isinstance(v, dict):
                     version = v.get('number', v.get('version', ''))
                     if version:
-                        versions_metadata[version] = v
+                        platform = v.get('platform', 'ruby')
+                        existing = versions_metadata.get(version)
+                        if existing is None:
+                            # First occurrence - store it
+                            versions_metadata[version] = v
+                        elif platform == 'ruby' and existing.get('platform') != 'ruby':
+                            # Prefer 'ruby' (pure Ruby) over platform-specific
+                            versions_metadata[version] = v
+                        # Otherwise keep existing (don't overwrite ruby with platform-specific)
                 elif isinstance(v, str):
                     versions_metadata[v] = {}
 
