@@ -310,7 +310,9 @@ class RubyGemsMetadataProvider(MetadataProviderBase):
             return cached
 
         # RubyGems API: /api/v2/rubygems/{name}/versions/{version}.json
-        data = self._fetch_api(f"/../v2/rubygems/{name}/versions/{version}.json")
+        # Specify platform=ruby to prefer MRI Ruby variant over java/jruby
+        # (gems like 'openssl' have both, and java variant has jruby-openssl dep)
+        data = self._fetch_api(f"/../v2/rubygems/{name}/versions/{version}.json?platform=ruby")
         if data:
             self._set_cached(cache_key, data)
             return data
